@@ -53,8 +53,18 @@ if OS == "Windows":
 
     TH32CS_SNAPPROCESS = 0x00000002
     PROCESS_TERMINATE = 0x0001
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    PROCESS_QUERY_INFORMATION = 0x0400
     WM_CLOSE = 0x0010
+    WM_SYSCOMMAND = 0x0112
+    SC_CLOSE = 0xF060
     SW_RESTORE = 9
+    SW_SHOW = 5
+    HWND_TOPMOST = -1
+    HWND_NOTOPMOST = -2
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_SHOWWINDOW = 0x0040
 
     class _PROCESSENTRY32W(ctypes.Structure):
         _fields_ = [
@@ -70,23 +80,81 @@ if OS == "Windows":
             ("szExeFile", ctypes.c_wchar * 260),
         ]
 
+    class _STARTUPINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR),
+            ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD),
+            ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD),
+            ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.c_void_p),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE),
+        ]
+
+    class _PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wintypes.HANDLE),
+            ("hThread", wintypes.HANDLE),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD),
+        ]
+
     _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     _DESKTOPENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.LPWSTR, wintypes.LPARAM)
 
     _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    _user32.SetForegroundWindow.restype = wintypes.BOOL
     _user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     _user32.BringWindowToTop.argtypes = [wintypes.HWND]
     _user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    _user32.IsIconic.argtypes = [wintypes.HWND]
     _user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
     _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     _user32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     _user32.OpenDesktopW.restype = wintypes.HANDLE
+    _user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _user32.OpenInputDesktop.restype = wintypes.HANDLE
     _user32.CloseDesktop.argtypes = [wintypes.HANDLE]
     _user32.EnumDesktopWindows.argtypes = [wintypes.HANDLE, _WNDENUMPROC, wintypes.LPARAM]
     _user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
     _user32.EnumDesktopsW.argtypes = [wintypes.HANDLE, _DESKTOPENUMPROC, wintypes.LPARAM]
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.SetThreadDesktop.argtypes = [wintypes.HANDLE]
+    _user32.SetThreadDesktop.restype = wintypes.BOOL
+    _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    _user32.GetAncestor.restype = wintypes.HWND
+    _user32.LockSetForegroundWindow.argtypes = [wintypes.UINT]
+    _user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.UINT,
+    ]
+
+    def _win_attach_desktop():
+        """Attach current thread to the active input desktop or Default desktop."""
+        hdesk = _user32.OpenInputDesktop(0, False, 0x01FF)
+        if not hdesk:
+            hdesk = _user32.OpenDesktopW("Default", 0, False, 0x01FF)
+        if hdesk:
+            _user32.SetThreadDesktop(hdesk)
+            return hdesk
+        return None
+
+    _win_attach_desktop()
 
 
 def _ps(script):
@@ -108,6 +176,26 @@ def _win_all_processes():
                 break
     _kernel32.CloseHandle(hSnap)
     return procs
+
+
+def _win_process_creation_time(pid):
+    """Return process creation time as integer (FILETIME 64-bit), or 0 if inaccessible."""
+    hProc = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not hProc:
+        hProc = _kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
+    if hProc:
+        ft_create = wintypes.FILETIME()
+        ft_exit = wintypes.FILETIME()
+        ft_kernel = wintypes.FILETIME()
+        ft_user = wintypes.FILETIME()
+        if _kernel32.GetProcessTimes(
+            hProc, ctypes.byref(ft_create), ctypes.byref(ft_exit),
+            ctypes.byref(ft_kernel), ctypes.byref(ft_user)
+        ):
+            _kernel32.CloseHandle(hProc)
+            return (ft_create.dwHighDateTime << 32) | ft_create.dwLowDateTime
+        _kernel32.CloseHandle(hProc)
+    return 0
 
 
 def _win_visible_windows():
@@ -184,50 +272,145 @@ def _win_match_procs(app):
     return matches
 
 
+class _WinProcess:
+    def __init__(self, pid, hProcess, hThread):
+        self.pid = pid
+        self.hProcess = hProcess
+        self.hThread = hThread
+        self.returncode = None
+
+    def poll(self):
+        if self.returncode is not None:
+            return self.returncode
+        code = wintypes.DWORD()
+        if _kernel32.GetExitCodeProcess(self.hProcess, ctypes.byref(code)):
+            if code.value != 259:  # STILL_ACTIVE
+                self.returncode = code.value
+                return self.returncode
+        return None
+
+    def close(self):
+        if self.hProcess:
+            _kernel32.CloseHandle(self.hProcess)
+            self.hProcess = None
+        if self.hThread:
+            _kernel32.CloseHandle(self.hThread)
+            self.hThread = None
+
+
+def _win_spawn(cmd_list):
+    """Spawn a process on the interactive desktop using CreateProcessW, with subprocess fallback."""
+    binary = shutil.which(cmd_list[0]) or shutil.which(f"{cmd_list[0]}.exe") or cmd_list[0]
+    full_cmd = [binary] + cmd_list[1:]
+    cmd_str = subprocess.list2cmdline(full_cmd)
+
+    hdesk = _user32.OpenInputDesktop(0, False, 0x01FF)
+    desk_name = "WinSta0\\Default"
+    if hdesk:
+        buf = ctypes.create_unicode_buffer(256)
+        if _user32.GetUserObjectInformationW(hdesk, 2, buf, 512, None) and buf.value:
+            desk_name = f"WinSta0\\{buf.value}"
+        _user32.CloseDesktop(hdesk)
+
+    si = _STARTUPINFOW()
+    si.cb = ctypes.sizeof(_STARTUPINFOW)
+    si.lpDesktop = desk_name
+    pi = _PROCESS_INFORMATION()
+
+    if _kernel32.CreateProcessW(None, cmd_str, None, None, False, 0, None, None, ctypes.byref(si), ctypes.byref(pi)):
+        return _WinProcess(pi.dwProcessId, pi.hProcess, pi.hThread)
+
+    return subprocess.Popen(
+        full_cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def win_open(app, args):
-    binary = shutil.which(app) or shutil.which(f"{app}.exe") or app
+    _win_attach_desktop()
+    initial_windows = {w["hwnd"] for w in _win_visible_windows()}
+    initial_pids = {p["pid"] for p in _win_match_procs(app)}
+
     try:
-        p = subprocess.Popen(
-            [binary] + args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        # Verify: a spawned PID is not a running app. Wait for a visible
-        # window owned by the process; report what actually appeared.
-        window_title = ""
-        alive = True
-        for _ in range(30):
-            time.sleep(0.1)
-            if p.poll() is not None:
+        proc = _win_spawn([app] + args)
+    except OSError as e:
+        return fail("open", f"could not start '{app}'", detail=str(e))
+
+    window_title = ""
+    target_pid = proc.pid
+    alive = True
+
+    for _ in range(30):
+        time.sleep(0.1)
+
+        # 1. Direct PID window match
+        for w in _win_visible_windows():
+            if w["pid"] == proc.pid:
+                window_title = w["title"]
+                target_pid = proc.pid
+                break
+        if window_title:
+            break
+
+        # 2. Check for newly appeared window matching app or process
+        curr_windows = _win_visible_windows()
+        new_windows = [w for w in curr_windows if w["hwnd"] not in initial_windows]
+        app_procs = _win_match_procs(app)
+        app_pids = {p["pid"] for p in app_procs}
+        app_lower = (app[:-4] if app.lower().endswith(".exe") else app).lower()
+
+        for w in new_windows:
+            if w["pid"] in app_pids or app_lower in w["title"].lower():
+                window_title = w["title"]
+                target_pid = w["pid"]
+                break
+        if window_title:
+            break
+
+        # 3. Check process exit
+        poll_code = proc.poll()
+        if poll_code is not None:
+            if poll_code != 0:
                 alive = False
                 break
-            for w in _win_visible_windows():
-                if w["pid"] == p.pid:
-                    window_title = w["title"]
-                    break
-            if window_title:
-                break
-        if not alive:
-            return fail("open", f"'{app}' exited immediately (code {p.returncode})",
-                        evidence={"pid": p.pid})
-        return emit({"ok": True, "action": "open", "app": app,
-                     "evidence": {"pid": p.pid, "verified": True,
-                                  "window": window_title}})
-    except OSError:
-        arg_str = " ".join(f"'{a}'" for a in args)
-        extra = f" -ArgumentList {arg_str}" if arg_str else ""
-        rc, out = _ps(f"Start-Process -FilePath '{app}'{extra} -PassThru | Select-Object -ExpandProperty Id")
-        if rc != 0 or not out.isdigit():
-            return fail("open", f"could not start '{app}'", detail=out)
-        return emit({"ok": True, "action": "open", "app": app, "evidence": {"pid": int(out)}})
+
+    if hasattr(proc, "close"):
+        proc.close()
+
+    if not alive:
+        return fail("open", f"'{app}' exited immediately (code {proc.poll()})",
+                    evidence={"pid": proc.pid})
+
+    if not window_title and proc.poll() == 0:
+        current_matches = _win_match_procs(app)
+        new_pids = [m["pid"] for m in current_matches if m["pid"] not in initial_pids]
+        if new_pids:
+            target_pid = new_pids[0]
+        elif current_matches:
+            target_pid = current_matches[0]["pid"]
+        else:
+            return fail("open", f"'{app}' exited immediately (code 0)",
+                        evidence={"pid": proc.pid})
+
+    evidence = {"pid": target_pid, "verified": bool(window_title)}
+    if window_title:
+        evidence["window"] = window_title
+    return emit({"ok": True, "action": "open", "app": app, "evidence": evidence})
 
 
 def win_status(app):
-    procs = _win_match_procs(app)
+    _win_attach_desktop()
+    if app.isdigit():
+        all_procs = {p["pid"]: p["name"] for p in _win_all_processes()}
+        procs = [{"pid": int(app), "name": all_procs.get(int(app), "")}] if int(app) in all_procs else []
+    else:
+        procs = _win_match_procs(app)
+
     windows = _win_visible_windows()
 
-    if not procs:
+    if not procs and not app.isdigit():
         app_lower = (app[:-4] if app.lower().endswith(".exe") else app).lower()
         matching_hwnds = [w for w in windows if app_lower in w["title"].lower()]
         if matching_hwnds:
@@ -279,69 +462,101 @@ def win_list():
 
 
 def win_focus(app):
-    app_lower = (app[:-4] if app.lower().endswith(".exe") else app).lower()
-    procs = _win_match_procs(app)
-    pids = {p["pid"] for p in procs}
-
-    target_hwnd = None
+    _win_attach_desktop()
     windows = _win_visible_windows()
 
-    for w in windows:
-        if w["pid"] in pids:
-            target_hwnd = w["hwnd"]
-            break
-
-    if not target_hwnd:
+    candidates = []
+    if app.isdigit():
+        candidates = [w for w in windows if w["pid"] == int(app)]
+    else:
+        app_lower = (app[:-4] if app.lower().endswith(".exe") else app).lower()
         for w in windows:
             if app_lower in w["title"].lower():
-                target_hwnd = w["hwnd"]
-                break
+                candidates.append(w)
+        if not candidates:
+            match_pids = {p["pid"] for p in _win_match_procs(app)}
+            candidates = [w for w in windows if w["pid"] in match_pids]
 
-    if not target_hwnd:
+    if not candidates:
         return fail("focus", f"no visible window for '{app}'")
 
-    _user32.ShowWindow(target_hwnd, SW_RESTORE)
-    _user32.GetForegroundWindow.restype = wintypes.HWND
+    candidates.sort(key=lambda w: _win_process_creation_time(w["pid"]), reverse=True)
+    target = candidates[0]
+    target_hwnd = target["hwnd"]
+    target_pid = target["pid"]
+    target_title = target["title"]
+
+    if _user32.IsIconic(target_hwnd):
+        _user32.ShowWindow(target_hwnd, SW_RESTORE)
+    else:
+        _user32.ShowWindow(target_hwnd, SW_SHOW)
+
     fore_wnd = _user32.GetForegroundWindow()
     fore_tid = _user32.GetWindowThreadProcessId(fore_wnd, None)
+    target_tid = _user32.GetWindowThreadProcessId(target_hwnd, None)
     cur_tid = _kernel32.GetCurrentThreadId()
-    if fore_tid != cur_tid:
+
+    if fore_tid and fore_tid != cur_tid:
         _user32.AttachThreadInput(cur_tid, fore_tid, True)
+    if target_tid and target_tid != cur_tid:
+        _user32.AttachThreadInput(cur_tid, target_tid, True)
+
+    _user32.LockSetForegroundWindow(2)  # LSFW_UNLOCK
+    _user32.keybd_event(0x12, 0, 0, 0)  # VK_MENU down
+    _user32.keybd_event(0x12, 0, 2, 0)  # VK_MENU up
+    _user32.SetWindowPos(target_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+    _user32.SetWindowPos(target_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
     _user32.BringWindowToTop(target_hwnd)
     _user32.SetForegroundWindow(target_hwnd)
-    if fore_tid != cur_tid:
-        _user32.AttachThreadInput(cur_tid, fore_tid, False)
 
-    # Verify: the call being sent is not success. Poll until the target
-    # actually owns the foreground, then report what we observed.
-    for _ in range(10):
+    if fore_tid and fore_tid != cur_tid:
+        _user32.AttachThreadInput(cur_tid, fore_tid, False)
+    if target_tid and target_tid != cur_tid:
+        _user32.AttachThreadInput(cur_tid, target_tid, False)
+
+    for _ in range(15):
         time.sleep(0.1)
-        if _user32.GetForegroundWindow() == target_hwnd:
+        fg = _user32.GetForegroundWindow()
+        if fg == target_hwnd or _user32.GetAncestor(fg, 2) == target_hwnd:
             return emit({"ok": True, "action": "focus", "app": app,
-                         "evidence": {"foreground": True, "verified": True}})
+                         "evidence": {"foreground": True, "verified": True,
+                                      "pid": target_pid, "window": target_title}})
+
     actual = _user32.GetForegroundWindow()
     return fail("focus", f"window did not come to foreground for '{app}'",
                 evidence={"foreground": False,
                           "expected_hwnd": target_hwnd,
-                          "actual_hwnd": actual})
+                          "actual_hwnd": actual,
+                          "pid": target_pid,
+                          "window": target_title})
 
 
 def win_quit(app, force):
-    app_lower = (app[:-4] if app.lower().endswith(".exe") else app).lower()
-    procs = _win_match_procs(app)
+    _win_attach_desktop()
+    if app.isdigit():
+        pids = [int(app)]
+        procs = [p for p in _win_all_processes() if p["pid"] == int(app)]
+    else:
+        app_lower = (app[:-4] if app.lower().endswith(".exe") else app).lower()
+        windows = _win_visible_windows()
+        title_windows = [w for w in windows if app_lower in w["title"].lower()]
+        if title_windows:
+            pids = list({w["pid"] for w in title_windows})
+            all_procs = {p["pid"]: p["name"] for p in _win_all_processes()}
+            procs = [{"pid": pid, "name": all_procs.get(pid, app)} for pid in pids]
+        else:
+            procs = _win_match_procs(app)
+            pids = [p["pid"] for p in procs]
+
     if not procs:
         return emit({"ok": True, "action": "quit", "app": app,
                      "evidence": {"running": False, "method": "already-closed"}})
 
-    pids = [p["pid"] for p in procs]
-
     if not force:
         windows = _win_visible_windows()
         target_hwnds = [w["hwnd"] for w in windows if w["pid"] in pids]
-        if not target_hwnds:
-            target_hwnds = [w["hwnd"] for w in windows if app_lower in w["title"].lower()]
-
         for hwnd in target_hwnds:
+            _user32.PostMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0)
             _user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
 
         for _ in range(15):
@@ -350,6 +565,10 @@ def win_quit(app, force):
             if not alive:
                 return emit({"ok": True, "action": "quit", "app": app,
                              "evidence": {"running": False, "method": "graceful"}})
+
+        alive = [p for p in _win_all_processes() if p["pid"] in pids]
+        return emit({"ok": True, "action": "quit", "app": app,
+                     "evidence": {"running": bool(alive), "method": "graceful"}})
 
     for pid in pids:
         hProc = _kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
@@ -360,8 +579,7 @@ def win_quit(app, force):
     time.sleep(0.2)
     still_alive = [p for p in _win_all_processes() if p["pid"] in pids]
     return emit({"ok": True, "action": "quit", "app": app,
-                 "evidence": {"running": False,
-                              "method": "force" if force else "graceful-timeout-force"}})
+                 "evidence": {"running": bool(still_alive), "method": "force"}})
 
 
 # ------------------------------------------------------------------ macOS ----
