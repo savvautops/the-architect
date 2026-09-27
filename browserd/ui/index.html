@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>saomusebrowser</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; background: #0b0d10; color: #e8eaed; font-family: system-ui, -apple-system, sans-serif; }
+  header { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #22262b; position: sticky; top: 0; background: #0b0d10; z-index: 5; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: #34d17b; }
+  #urlbar { flex: 1; display: flex; gap: 6px; }
+  #url { flex: 1; background: #171b20; border: 1px solid #2a2f36; color: #e8eaed; border-radius: 10px; padding: 10px 12px; font-size: 15px; min-width: 0; }
+  button { background: #1f6feb; border: none; color: #fff; border-radius: 10px; padding: 10px 14px; font-size: 15px; font-weight: 600; }
+  button.ghost { background: #22262c; color: #e8eaed; }
+  button:active { opacity: .7; }
+  #tabs { display: flex; gap: 6px; overflow-x: auto; padding: 8px 12px; border-bottom: 1px solid #22262b; }
+  .tab { white-space: nowrap; background: #171b20; border: 1px solid #2a2f36; border-radius: 8px; padding: 8px 10px; font-size: 13px; display: flex; gap: 8px; align-items: center; }
+  .tab.on { border-color: #1f6feb; }
+  .tab .x { color: #8b949e; padding: 2px 6px; }
+  #viewwrap { position: relative; margin: 10px 12px 0; border: 1px solid #2a2f36; border-radius: 12px; overflow: hidden; background: #000; min-height: 200px; }
+  #view { width: 100%; display: block; touch-action: manipulation; }
+  #hint { text-align: center; color: #8b949e; font-size: 12px; padding: 6px; }
+  .row { display: flex; gap: 6px; padding: 8px 12px; }
+  .row input[type=text] { flex: 1; background: #171b20; border: 1px solid #2a2f36; color: #e8eaed; border-radius: 10px; padding: 10px 12px; font-size: 15px; min-width: 0; }
+  .keys { display: flex; gap: 6px; padding: 0 12px 8px; flex-wrap: wrap; }
+  .keys button { flex: 1; padding: 12px 0; font-size: 14px; }
+  #status { color: #8b949e; font-size: 12px; padding: 4px 12px 16px; word-break: break-all; }
+  #live { margin-left: auto; }
+  #live.off { background: #22262c; }
+</style>
+</head>
+<body>
+<header>
+  <span id="dot"></span><h1>saomusebrowser</h1>
+  <button id="live" class="ghost off">live: off</button>
+</header>
+<div class="row" style="padding-top:10px">
+  <div id="urlbar"><input id="url" type="text" placeholder="https://…" enterkeyhint="go"></div>
+  <button id="go">go</button>
+</div>
+<div id="tabs"></div>
+<div id="viewwrap"><img id="view" alt="browser view — tap to click"></div>
+<div id="hint">tap the page to click · live view refreshes while on</div>
+<div class="row">
+  <input id="txt" type="text" placeholder="type into focused field…" enterkeyhint="send">
+  <button id="send">type</button>
+</div>
+<div class="keys">
+  <button class="ghost" data-k="Enter">⏎</button>
+  <button class="ghost" data-k="Tab">tab</button>
+  <button class="ghost" data-k="Escape">esc</button>
+  <button class="ghost" data-k="Backspace">⌫</button>
+  <button class="ghost" data-k="ArrowLeft">←</button>
+  <button class="ghost" data-k="ArrowRight">→</button>
+</div>
+<div class="row">
+  <button class="ghost" id="back">◀</button>
+  <button class="ghost" id="fwd">▶</button>
+  <button class="ghost" id="rel">⟳</button>
+  <button class="ghost" id="newtab" style="margin-left:auto">+ tab</button>
+</div>
+<div id="status"></div>
+<script>
+let token = localStorage.getItem('bd_token') || '';
+if (!token) { token = prompt('browserd token:') || ''; localStorage.setItem('bd_token', token); }
+const H = { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' };
+const $ = id => document.getElementById(id);
+
+async function api(path, opts={}) {
+  const r = await fetch(path, { ...opts, headers: H });
+  const ct = r.headers.get('content-type') || '';
+  if (!r.ok) throw new Error('http ' + r.status);
+  return ct.includes('json') ? r.json() : r.blob();
+}
+async function refresh(quiet) {
+  try {
+    const s = await api('/api/status');
+    $('url').value = s.current_url || '';
+    $('status').textContent = (s.browser || '') + ' · ' + (s.viewport ? s.viewport.w + '×' + s.viewport.h : '');
+    const tabs = $('tabs'); tabs.innerHTML = '';
+    for (const t of s.tabs) {
+      const d = document.createElement('div');
+      d.className = 'tab' + (t.active ? ' on' : '');
+      const label = document.createElement('span');
+      label.textContent = (t.title || t.url || 'tab').slice(0, 28);
+      label.onclick = () => api('/api/tabs/activate', { method: 'POST', body: JSON.stringify({ id: t.id }) }).then(refresh);
+      const x = document.createElement('span');
+      x.className = 'x'; x.textContent = '×';
+      x.onclick = e => { e.stopPropagation(); fetch('/api/tabs?id=' + encodeURIComponent(t.id), { method: 'DELETE', headers: H }).then(refresh); };
+      d.append(label, x); tabs.append(d);
+    }
+    $('dot').style.background = '#34d17b';
+  } catch (e) { if (!quiet) $('status').textContent = 'error: ' + e.message; $('dot').style.background = '#e5534b'; }
+}
+async function shot() {
+  try {
+    const b = await api('/api/screenshot?' + Date.now());
+    $('view').src = URL.createObjectURL(b);
+  } catch (e) { /* keep last frame */ }
+}
+$('view').addEventListener('click', async e => {
+  const img = $('view');
+  if (!img.naturalWidth) return;
+  const x = Math.round(e.offsetX / img.clientWidth * img.naturalWidth);
+  const y = Math.round(e.offsetY / img.clientHeight * img.naturalHeight);
+  await api('/api/click', { method: 'POST', body: JSON.stringify({ x, y }) });
+  shot(); refresh(true);
+});
+$('go').onclick = async () => {
+  let u = $('url').value.trim();
+  if (u && !/^https?:\/\//i.test(u)) u = 'https://' + u;
+  await api('/api/navigate', { method: 'POST', body: JSON.stringify({ url: u }) });
+  shot(); refresh(true);
+};
+$('url').addEventListener('keydown', e => { if (e.key === 'Enter') $('go').click(); });
+$('send').onclick = async () => {
+  const t = $('txt').value; if (!t) return;
+  await api('/api/type', { method: 'POST', body: JSON.stringify({ text: t }) });
+  $('txt').value = ''; shot();
+};
+document.querySelectorAll('.keys button').forEach(b =>
+  b.onclick = () => api('/api/key', { method: 'POST', body: JSON.stringify({ key: b.dataset.k }) }).then(shot));
+$('back').onclick = () => api('/api/back', { method: 'POST' }).then(() => { shot(); refresh(true); });
+$('fwd').onclick = () => api('/api/forward', { method: 'POST' }).then(() => { shot(); refresh(true); });
+$('rel').onclick = () => api('/api/reload', { method: 'POST' }).then(() => { shot(); refresh(true); });
+$('newtab').onclick = () => api('/api/tabs', { method: 'POST', body: '{}' }).then(() => refresh(true));
+let liveTimer = null;
+$('live').onclick = () => {
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; $('live').textContent = 'live: off'; $('live').classList.add('off'); }
+  else { liveTimer = setInterval(shot, 800); $('live').textContent = 'live: on'; $('live').classList.remove('off'); shot(); }
+};
+refresh(); shot();
+</script>
+</body>
+</html>
