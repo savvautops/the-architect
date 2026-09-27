@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""appctl v0.1 — cross-platform application lifecycle adapter for The Architect.
+"""appctl v0.2 — cross-platform application lifecycle & observation adapter for The Architect.
 
-One typed vocabulary for app lifecycle on any OS, so the agent never invents
-raw shell text. Every command emits JSON evidence the verifier can check.
+One typed vocabulary for app lifecycle and observation on any OS, so the agent never
+invents raw shell text. Every command emits JSON evidence the verifier can check.
 
-    appctl open <app> [--args ...]     start an application
-    appctl focus <app>                 bring its window to the foreground
-    appctl status <app> [--json]       is it running? pid, window title
-    appctl list                        running GUI processes
-    appctl quit <app> [--force]        close gracefully, or force-kill
+    appctl open <app> [--args ...]                         start an application
+    appctl focus <app>                                     bring its window to foreground
+    appctl see <app> [--output <path>]                     capture window screenshot (PNG)
+    appctl diff <before.png> <after.png> [--region ..]     detect pixel changes / verify UI
+    appctl type <app> <text>                               send typed text to application
+    appctl key <app> <key>                                 send keystroke/combination
+    appctl status <app> [--json]                           is it running? pid, window title
+    appctl list                                            running GUI processes
+    appctl quit <app> [--force]                            close gracefully, or force-kill
 
 Exit codes: 0 = ok, 1 = action failed (app not found / not running), 2 = usage error.
 All output is JSON on stdout: {"ok": bool, "action": str, ...}.
@@ -16,10 +20,14 @@ All output is JSON on stdout: {"ok": bool, "action": str, ...}.
 
 import argparse
 import json
+import os
 import platform
 import shutil
+import struct
 import subprocess
 import sys
+import time
+import zlib
 
 OS = platform.system()  # Windows | Darwin | Linux
 
@@ -110,6 +118,46 @@ if OS == "Windows":
             ("dwThreadId", wintypes.DWORD),
         ]
 
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", wintypes.DWORD),
+            ("biWidth", ctypes.c_long),
+            ("biHeight", ctypes.c_long),
+            ("biPlanes", wintypes.WORD),
+            ("biBitCount", wintypes.WORD),
+            ("biCompression", wintypes.DWORD),
+            ("biSizeImage", wintypes.DWORD),
+            ("biXPelsPerMeter", ctypes.c_long),
+            ("biYPelsPerMeter", ctypes.c_long),
+            ("biClrUsed", wintypes.DWORD),
+            ("biClrImportant", wintypes.DWORD),
+        ]
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_void_p),
+        ]
+
+    class INPUT(ctypes.Structure):
+        class _U(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT)]
+        _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+    _gdi32 = ctypes.windll.gdi32
+    _dwmapi = ctypes.windll.dwmapi
+
     _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     _DESKTOPENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.LPWSTR, wintypes.LPARAM)
 
@@ -143,6 +191,27 @@ if OS == "Windows":
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         wintypes.UINT,
     ]
+    _user32.GetDC.argtypes = [wintypes.HWND]
+    _user32.GetDC.restype = wintypes.HDC
+    _user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    _user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+    _user32.PrintWindow.restype = wintypes.BOOL
+    _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+    _user32.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
+    _user32.SendInput.restype = wintypes.UINT
+
+    _gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    _gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    _gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+    _gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    _gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    _gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    _gdi32.BitBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+    _gdi32.BitBlt.restype = wintypes.BOOL
+    _gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT, ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT]
+    _gdi32.GetDIBits.restype = ctypes.c_int
+    _gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    _gdi32.DeleteDC.argtypes = [wintypes.HDC]
 
     def _win_attach_desktop():
         """Attach current thread to the active input desktop or Default desktop."""
@@ -461,10 +530,9 @@ def win_list():
         "processes": results}})
 
 
-def win_focus(app):
-    _win_attach_desktop()
+def _win_resolve_target(app):
+    """Find visible window matching app name, title substring, or PID (newest first)."""
     windows = _win_visible_windows()
-
     candidates = []
     if app.isdigit():
         candidates = [w for w in windows if w["pid"] == int(app)]
@@ -478,14 +546,21 @@ def win_focus(app):
             candidates = [w for w in windows if w["pid"] in match_pids]
 
     if not candidates:
-        return fail("focus", f"no visible window for '{app}'")
+        return None
 
-    candidates.sort(key=lambda w: _win_process_creation_time(w["pid"]), reverse=True)
-    target = candidates[0]
-    target_hwnd = target["hwnd"]
-    target_pid = target["pid"]
-    target_title = target["title"]
+    def _win_area(w):
+        r = RECT()
+        if _user32.GetWindowRect(w["hwnd"], ctypes.byref(r)):
+            return max(0, r.right - r.left) * max(0, r.bottom - r.top)
+        return 0
 
+    candidates.sort(key=lambda w: (_win_process_creation_time(w["pid"]), _win_area(w)), reverse=True)
+    return candidates[0]
+
+
+def _win_focus_window(target_hwnd):
+    """Attach to desktop, restore, bypass foreground-lock, and poll for foreground verification."""
+    _win_attach_desktop()
     if _user32.IsIconic(target_hwnd):
         _user32.ShowWindow(target_hwnd, SW_RESTORE)
     else:
@@ -518,17 +593,236 @@ def win_focus(app):
         time.sleep(0.1)
         fg = _user32.GetForegroundWindow()
         if fg == target_hwnd or _user32.GetAncestor(fg, 2) == target_hwnd:
-            return emit({"ok": True, "action": "focus", "app": app,
-                         "evidence": {"foreground": True, "verified": True,
-                                      "pid": target_pid, "window": target_title}})
+            return True, fg
+    return False, _user32.GetForegroundWindow()
 
-    actual = _user32.GetForegroundWindow()
-    return fail("focus", f"window did not come to foreground for '{app}'",
-                evidence={"foreground": False,
-                          "expected_hwnd": target_hwnd,
-                          "actual_hwnd": actual,
-                          "pid": target_pid,
-                          "window": target_title})
+
+def win_focus(app):
+    target = _win_resolve_target(app)
+    if not target:
+        return fail("focus", f"no visible window for '{app}'")
+
+    target_hwnd = target["hwnd"]
+    target_pid = target["pid"]
+    target_title = target["title"]
+
+    ok, actual = _win_focus_window(target_hwnd)
+    if ok:
+        return emit({
+            "ok": True,
+            "action": "focus",
+            "app": app,
+            "evidence": {
+                "foreground": True,
+                "verified": True,
+                "pid": target_pid,
+                "window": target_title,
+            }
+        })
+
+    return fail(
+        "focus",
+        f"window did not come to foreground for '{app}'",
+        evidence={
+            "foreground": False,
+            "expected_hwnd": target_hwnd,
+            "actual_hwnd": actual,
+            "pid": target_pid,
+            "window": target_title,
+        },
+    )
+
+
+def win_see(app, output_path=None):
+    _win_attach_desktop()
+    target = _win_resolve_target(app)
+    if not target:
+        return fail("see", f"no visible window for '{app}'")
+
+    target_hwnd = target["hwnd"]
+    target_pid = target["pid"]
+    target_title = target["title"]
+
+    rect = RECT()
+    if _dwmapi.DwmGetWindowAttribute(target_hwnd, 9, ctypes.byref(rect), ctypes.sizeof(RECT)) != 0:
+        _user32.GetWindowRect(target_hwnd, ctypes.byref(rect))
+
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    if width <= 0 or height <= 0:
+        return fail("see", f"invalid window geometry ({width}x{height}) for '{app}'")
+
+    hdc_screen = _user32.GetDC(0)
+    hdc_mem = _gdi32.CreateCompatibleDC(hdc_screen)
+    hbm = _gdi32.CreateCompatibleBitmap(hdc_screen, width, height)
+    _gdi32.SelectObject(hdc_mem, hbm)
+
+    captured = _user32.PrintWindow(target_hwnd, hdc_mem, 2)
+    if not captured:
+        _gdi32.BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, rect.left, rect.top, 0x00CC0020 | 0x40000000)
+
+    bih = BITMAPINFOHEADER()
+    bih.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bih.biWidth = width
+    bih.biHeight = -height
+    bih.biPlanes = 1
+    bih.biBitCount = 32
+    bih.biCompression = 0
+
+    buf = ctypes.create_string_buffer(width * height * 4)
+    _gdi32.GetDIBits(hdc_mem, hbm, 0, height, buf, ctypes.byref(bih), 0)
+
+    _gdi32.DeleteObject(hbm)
+    _gdi32.DeleteDC(hdc_mem)
+    _user32.ReleaseDC(0, hdc_screen)
+
+    raw_bgra = memoryview(buf)
+    rgb_data = bytearray(width * height * 3)
+    rgb_data[0::3] = raw_bgra[2::4]
+    rgb_data[1::3] = raw_bgra[1::4]
+    rgb_data[2::3] = raw_bgra[0::4]
+
+    png_bytes = encode_png_rgb(width, height, rgb_data)
+
+    if not output_path:
+        clean_app = "".join(c for c in app if c.isalnum() or c in ("-", "_"))
+        out_dir = os.path.join(os.environ.get("TEMP", "."), "appctl_see")
+        os.makedirs(out_dir, exist_ok=True)
+        output_path = os.path.join(out_dir, f"{clean_app}_{int(time.time() * 1000)}.png")
+
+    with open(output_path, "wb") as f:
+        f.write(png_bytes)
+
+    return emit({
+        "ok": True,
+        "action": "see",
+        "app": app,
+        "evidence": {
+            "path": os.path.abspath(output_path),
+            "geometry": {"x": rect.left, "y": rect.top, "w": width, "h": height},
+            "pid": target_pid,
+            "hwnd": target_hwnd,
+            "window": target_title,
+            "size_bytes": len(png_bytes),
+        }
+    })
+
+
+def win_type(app, text):
+    _win_attach_desktop()
+    target = _win_resolve_target(app)
+    if not target:
+        return fail("type", f"no visible window for '{app}'")
+
+    _win_focus_window(target["hwnd"])
+    time.sleep(0.05)
+
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_UNICODE = 0x0004
+    INPUT_KEYBOARD = 1
+
+    chars_sent = 0
+    for char in text:
+        if char == "\r":
+            continue
+        if char == "\n":
+            inputs = (INPUT * 2)()
+            inputs[0].type = INPUT_KEYBOARD
+            inputs[0].u.ki.wVk = 0x0D
+            inputs[1].type = INPUT_KEYBOARD
+            inputs[1].u.ki.wVk = 0x0D
+            inputs[1].u.ki.dwFlags = KEYEVENTF_KEYUP
+            _user32.SendInput(2, inputs, ctypes.sizeof(INPUT))
+        else:
+            code = ord(char)
+            inputs = (INPUT * 2)()
+            inputs[0].type = INPUT_KEYBOARD
+            inputs[0].u.ki.wScan = code
+            inputs[0].u.ki.dwFlags = KEYEVENTF_UNICODE
+            inputs[1].type = INPUT_KEYBOARD
+            inputs[1].u.ki.wScan = code
+            inputs[1].u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+            _user32.SendInput(2, inputs, ctypes.sizeof(INPUT))
+        chars_sent += 1
+        time.sleep(0.01)
+
+    return emit({
+        "ok": True,
+        "action": "type",
+        "app": app,
+        "evidence": {
+            "typed": True,
+            "chars": chars_sent,
+            "pid": target["pid"],
+            "window": target["title"],
+        }
+    })
+
+
+def win_key(app, key_name):
+    _win_attach_desktop()
+    target = _win_resolve_target(app)
+    if not target:
+        return fail("key", f"no visible window for '{app}'")
+
+    _win_focus_window(target["hwnd"])
+    time.sleep(0.05)
+
+    VK_MAP = {
+        "enter": 0x0D, "return": 0x0D, "tab": 0x09, "escape": 0x1B, "esc": 0x1B,
+        "backspace": 0x08, "space": 0x20, "up": 0x26, "down": 0x28, "left": 0x25,
+        "right": 0x27, "delete": 0x2E, "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22
+    }
+
+    key_lower = key_name.lower()
+    ctrl = False
+    shift = False
+    alt = False
+
+    parts = key_lower.split("+")
+    actual_key = parts[-1]
+    for m in parts[:-1]:
+        if m in ("ctrl", "control"):
+            ctrl = True
+        elif m == "shift":
+            shift = True
+        elif m == "alt":
+            alt = True
+
+    vk = VK_MAP.get(actual_key)
+    if not vk:
+        if len(actual_key) == 1:
+            vk = ord(actual_key.upper())
+        else:
+            return fail("key", f"unsupported key: '{key_name}'")
+
+    def key_event(v, up=False):
+        flags = 0x0002 if up else 0
+        _user32.keybd_event(v, 0, flags, 0)
+
+    if ctrl: key_event(0x11, False)
+    if shift: key_event(0x10, False)
+    if alt: key_event(0x12, False)
+
+    key_event(vk, False)
+    time.sleep(0.02)
+    key_event(vk, True)
+
+    if alt: key_event(0x12, True)
+    if shift: key_event(0x10, True)
+    if ctrl: key_event(0x11, True)
+
+    return emit({
+        "ok": True,
+        "action": "key",
+        "app": app,
+        "evidence": {
+            "sent": True,
+            "key": key_name,
+            "pid": target["pid"],
+            "window": target["title"],
+        }
+    })
 
 
 def win_quit(app, force):
@@ -582,6 +876,214 @@ def win_quit(app, force):
                  "evidence": {"running": bool(still_alive), "method": "force"}})
 
 
+# ----------------------------------------------------------- PNG & Diff Engine -
+def _png_chunk(tag, data):
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+
+def encode_png_rgb(width, height, rgb_bytes):
+    """Encode raw RGB bytes (width * height * 3) into PNG format."""
+    header = b"\x89PNG\r\n\x1a\n"
+    ihdr = _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    raw_lines = bytearray()
+    stride = width * 3
+    for y in range(height):
+        raw_lines.append(0)  # filter None
+        raw_lines.extend(rgb_bytes[y * stride : (y + 1) * stride])
+    idat = _png_chunk(b"IDAT", zlib.compress(bytes(raw_lines), level=6))
+    iend = _png_chunk(b"IEND", b"")
+    return header + ihdr + idat + iend
+
+
+def decode_png(png_bytes):
+    """Decode PNG bytes into (width, height, rgb_bytes). Returns RGB 3-bytes-per-pixel."""
+    if not png_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("Invalid PNG signature")
+    idx = 8
+    idat_parts = []
+    width = height = color_type = bit_depth = None
+    while idx < len(png_bytes):
+        length = struct.unpack(">I", png_bytes[idx : idx + 4])[0]
+        tag = png_bytes[idx + 4 : idx + 8]
+        data = png_bytes[idx + 8 : idx + 8 + length]
+        idx += 12 + length
+        if tag == b"IHDR":
+            width, height, bit_depth, color_type = struct.unpack(">IIBB", data[:10])
+        elif tag == b"IDAT":
+            idat_parts.append(data)
+        elif tag == b"IEND":
+            break
+
+    if not width or not height or bit_depth != 8:
+        raise ValueError("Unsupported PNG format (expected 8-bit depth)")
+
+    channels = 4 if color_type == 6 else (3 if color_type == 2 else (1 if color_type == 0 else 3))
+    raw = zlib.decompress(b"".join(idat_parts))
+    stride = 1 + width * channels
+    pixels = bytearray(width * height * channels)
+    prev_line = bytearray(width * channels)
+
+    def _paeth(a, b, c):
+        p = a + b - c
+        pa = abs(p - a)
+        pb = abs(p - b)
+        pc = abs(p - c)
+        if pa <= pb and pa <= pc:
+            return a
+        elif pb <= pc:
+            return b
+        return c
+
+    for y in range(height):
+        line_start = y * stride
+        filt = raw[line_start]
+        line_data = raw[line_start + 1 : line_start + stride]
+        curr_line = bytearray(width * channels)
+        for x in range(width * channels):
+            val = line_data[x]
+            a = curr_line[x - channels] if x >= channels else 0
+            b = prev_line[x]
+            c = prev_line[x - channels] if x >= channels else 0
+            if filt == 0:
+                res = val
+            elif filt == 1:
+                res = (val + a) & 0xFF
+            elif filt == 2:
+                res = (val + b) & 0xFF
+            elif filt == 3:
+                res = (val + ((a + b) // 2)) & 0xFF
+            elif filt == 4:
+                res = (val + _paeth(a, b, c)) & 0xFF
+            else:
+                res = val
+            curr_line[x] = res
+        pixels[y * width * channels : (y + 1) * width * channels] = curr_line
+        prev_line = curr_line
+
+    if channels == 4:
+        rgb = bytearray(width * height * 3)
+        mv = memoryview(pixels)
+        rgb[0::3] = mv[0::4]
+        rgb[1::3] = mv[1::4]
+        rgb[2::3] = mv[2::4]
+        return width, height, bytes(rgb)
+    elif channels == 1:
+        rgb = bytearray(width * height * 3)
+        mv = memoryview(pixels)
+        rgb[0::3] = mv
+        rgb[1::3] = mv
+        rgb[2::3] = mv
+        return width, height, bytes(rgb)
+    return width, height, bytes(pixels)
+
+
+def compute_diff(before_path, after_path, region_str=None, mask_str=None, threshold=0.001):
+    """Compare two PNG images for pixel changes with optional region & mask. Returns dict result."""
+    if not os.path.exists(before_path):
+        raise FileNotFoundError(f"before image not found: '{before_path}'")
+    if not os.path.exists(after_path):
+        raise FileNotFoundError(f"after image not found: '{after_path}'")
+
+    with open(before_path, "rb") as f:
+        b_data = f.read()
+    with open(after_path, "rb") as f:
+        a_data = f.read()
+    w1, h1, rgb1 = decode_png(b_data)
+    w2, h2, rgb2 = decode_png(a_data)
+
+    if (w1, h1) != (w2, h2):
+        return {
+            "ok": True,
+            "action": "diff",
+            "evidence": {
+                "changed": True,
+                "geometry_changed": True,
+                "before": {"w": w1, "h": h1},
+                "after": {"w": w2, "h": h2},
+                "verdict": "pass",
+            }
+        }
+
+    def parse_rect(s):
+        if not s:
+            return None
+        parts = [int(p.strip()) for p in s.split(",")]
+        if len(parts) != 4:
+            raise ValueError("Expected x,y,w,h (4 integers)")
+        return parts
+
+    region = parse_rect(region_str)
+    mask = parse_rect(mask_str)
+
+    rx, ry, rw, rh = region if region else (0, 0, w1, h1)
+    rx = max(0, min(rx, w1 - 1))
+    ry = max(0, min(ry, h1 - 1))
+    rw = max(1, min(rw, w1 - rx))
+    rh = max(1, min(rh, h1 - ry))
+
+    mx, my, mw, mh = mask if mask else (-1, -1, 0, 0)
+
+    changed_pixels = 0
+    total_evaluated = 0
+    min_x, max_x = w1, -1
+    min_y, max_y = h1, -1
+    color_tolerance = 15
+
+    for y in range(ry, ry + rh):
+        stride = y * w1 * 3
+        is_mask_y = (my <= y < my + mh) if mask else False
+        for x in range(rx, rx + rw):
+            if is_mask_y and (mx <= x < mx + mw):
+                continue
+            total_evaluated += 1
+            px = stride + x * 3
+            diff = (
+                abs(rgb1[px] - rgb2[px])
+                + abs(rgb1[px + 1] - rgb2[px + 1])
+                + abs(rgb1[px + 2] - rgb2[px + 2])
+            )
+            if diff > color_tolerance:
+                changed_pixels += 1
+                if x < min_x: min_x = x
+                if x > max_x: max_x = x
+                if y < min_y: min_y = y
+                if y > max_y: max_y = y
+
+    diff_ratio = (changed_pixels / total_evaluated) if total_evaluated > 0 else 0.0
+    is_changed = diff_ratio >= threshold
+
+    bbox = None
+    if changed_pixels > 0:
+        bbox = {
+            "x": min_x,
+            "y": min_y,
+            "w": max_x - min_x + 1,
+            "h": max_y - min_y + 1,
+        }
+
+    return {
+        "ok": True,
+        "action": "diff",
+        "evidence": {
+            "changed": is_changed,
+            "difference": round(diff_ratio, 6),
+            "changed_pixels": changed_pixels,
+            "total_evaluated_pixels": total_evaluated,
+            "bounding_box": bbox,
+            "threshold": threshold,
+            "verdict": "pass" if is_changed else "fail",
+        }
+    }
+
+
+def run_diff(before_path, after_path, region_str=None, mask_str=None, threshold=0.001):
+    try:
+        res = compute_diff(before_path, after_path, region_str, mask_str, threshold)
+        return emit(res)
+    except Exception as e:
+        return fail("diff", str(e))
+
+
 # ------------------------------------------------------------------ macOS ----
 def mac_open(app, args):
     cmd = ["open", "-a", app] + (["--args"] + args if args else [])
@@ -621,6 +1123,30 @@ def mac_focus(app):
                  "evidence": {"foreground": True}})
 
 
+def mac_see(app, output_path=None):
+    import tempfile
+    output_path = output_path or os.path.join(tempfile.gettempdir(), f"see_{int(time.time()*1000)}.png")
+    rc, out = run(["screencapture", "-x", output_path])
+    if rc != 0:
+        return fail("see", f"could not capture screenshot for '{app}'", detail=out)
+    return emit({"ok": True, "action": "see", "app": app, "evidence": {"path": output_path}})
+
+
+def mac_type(app, text):
+    escaped = text.replace('"', '\\"')
+    rc, out = run(["osascript", "-e", f'tell application "{app}" to activate',
+                   "-e", f'tell application "System Events" to keystroke "{escaped}"'])
+    if rc != 0:
+        return fail("type", f"could not type into '{app}'", detail=out)
+    return emit({"ok": True, "action": "type", "app": app, "evidence": {"typed": True, "chars": len(text)}})
+
+
+def mac_key(app, key_name):
+    rc, out = run(["osascript", "-e", f'tell application "{app}" to activate',
+                   "-e", f'tell application "System Events" to keystroke "{key_name}"'])
+    return emit({"ok": True, "action": "key", "app": app, "evidence": {"sent": True, "key": key_name}})
+
+
 # ------------------------------------------------------------------ Linux ----
 def lin_open(app, args):
     binary = shutil.which(app) or app
@@ -646,7 +1172,6 @@ def lin_status(app):
 
 def _live_pids(app):
     """PIDs matching app, excluding PID 1, ourselves, and anything appctl-related."""
-    import os
     rc, out = run(["pgrep", "-f", app])
     me = os.getpid()
     live = []
@@ -666,7 +1191,7 @@ def _live_pids(app):
 
 
 def lin_quit(app, force):
-    import os, signal, time
+    import signal
     targets = _live_pids(app)
     sig = signal.SIGKILL if force else signal.SIGTERM
     for pid in targets:
@@ -674,7 +1199,6 @@ def lin_quit(app, force):
             os.kill(pid, sig)
         except OSError:
             pass
-    # Graceful close gets a moment; then confirm.
     for _ in range(6):
         time.sleep(0.5)
         if not _live_pids(app):
@@ -687,7 +1211,6 @@ def lin_quit(app, force):
 
 
 def lin_focus(app):
-    # Best-effort: needs wmctrl or xdotool; absent on most stock installs.
     if shutil.which("wmctrl"):
         rc, out = run(["wmctrl", "-a", app])
         if rc == 0:
@@ -701,20 +1224,63 @@ def lin_focus(app):
     return fail("focus", "no window manager tool (install wmctrl or xdotool)")
 
 
+def lin_see(app, output_path=None):
+    import tempfile
+    output_path = output_path or os.path.join(tempfile.gettempdir(), f"see_{int(time.time()*1000)}.png")
+    if shutil.which("grim"):
+        rc, out = run(["grim", output_path])
+    elif shutil.which("import"):
+        rc, out = run(["import", "-window", "root", output_path])
+    elif shutil.which("scrot"):
+        rc, out = run(["scrot", output_path])
+    else:
+        return fail("see", "no screenshot utility found (install grim, scrot, or imagemagick)")
+    if rc != 0:
+        return fail("see", f"could not capture screenshot for '{app}'", detail=out)
+    return emit({"ok": True, "action": "see", "app": app, "evidence": {"path": output_path}})
+
+
+def lin_type(app, text):
+    if shutil.which("xdotool"):
+        rc, out = run(["xdotool", "type", "--", text])
+        if rc == 0:
+            return emit({"ok": True, "action": "type", "app": app, "evidence": {"typed": True, "chars": len(text)}})
+    return fail("type", "no input tool (install xdotool)")
+
+
+def lin_key(app, key_name):
+    if shutil.which("xdotool"):
+        rc, out = run(["xdotool", "key", key_name])
+        if rc == 0:
+            return emit({"ok": True, "action": "key", "app": app, "evidence": {"sent": True, "key": key_name}})
+    return fail("key", "no input tool (install xdotool)")
+
+
 # ------------------------------------------------------------------ dispatch -
 HANDLERS = {
-    "Windows": {"open": win_open, "focus": win_focus, "status": win_status,
-                "list": lambda: win_list(), "quit": win_quit},
-    "Darwin": {"open": mac_open, "focus": mac_focus, "status": mac_status,
-               "list": lambda: mac_status(""), "quit": mac_quit},
-    "Linux": {"open": lin_open, "focus": lin_focus, "status": lin_status,
-              "list": lambda: lin_status(""), "quit": lin_quit},
+    "Windows": {
+        "open": win_open, "focus": win_focus, "status": win_status,
+        "list": lambda: win_list(), "quit": win_quit,
+        "see": win_see, "type": win_type, "key": win_key,
+    },
+    "Darwin": {
+        "open": mac_open, "focus": mac_focus, "status": mac_status,
+        "list": lambda: mac_status(""), "quit": mac_quit,
+        "see": mac_see, "type": mac_type, "key": mac_key,
+    },
+    "Linux": {
+        "open": lin_open, "focus": lin_focus, "status": lin_status,
+        "list": lambda: lin_status(""), "quit": lin_quit,
+        "see": lin_see, "type": lin_type, "key": lin_key,
+    },
 }
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="appctl",
-                                 description="Cross-platform app lifecycle adapter (The Architect v0.1)")
+    ap = argparse.ArgumentParser(
+        prog="appctl",
+        description="Cross-platform app lifecycle & observation adapter (The Architect v0.2)",
+    )
     sub = ap.add_subparsers(dest="action", required=True)
 
     p = sub.add_parser("open", help="start an application")
@@ -723,6 +1289,25 @@ def main():
 
     p = sub.add_parser("focus", help="bring app window to foreground")
     p.add_argument("app")
+
+    p = sub.add_parser("see", help="capture window screenshot to PNG")
+    p.add_argument("app")
+    p.add_argument("--output", "-o", default=None, help="path to save PNG screenshot")
+
+    p = sub.add_parser("diff", help="compare two PNG screenshots for pixel changes")
+    p.add_argument("before", help="path to before PNG")
+    p.add_argument("after", help="path to after PNG")
+    p.add_argument("--region", default=None, help="bounding region x,y,w,h to evaluate")
+    p.add_argument("--mask", default=None, help="bounding region x,y,w,h to ignore")
+    p.add_argument("--threshold", type=float, default=0.001, help="minimum change ratio to pass (default: 0.001)")
+
+    p = sub.add_parser("type", help="type text into application")
+    p.add_argument("app")
+    p.add_argument("text")
+
+    p = sub.add_parser("key", help="send special key / key combo to application")
+    p.add_argument("app")
+    p.add_argument("key")
 
     p = sub.add_parser("status", help="is the app running? (pid, window)")
     p.add_argument("app")
@@ -734,6 +1319,11 @@ def main():
     p.add_argument("--force", action="store_true", help="kill instead of asking nicely")
 
     a = ap.parse_args()
+
+    if a.action == "diff":
+        run_diff(a.before, a.after, a.region, a.mask, a.threshold)
+        return
+
     h = HANDLERS.get(OS)
     if not h:
         fail(a.action, f"unsupported OS: {OS}")
@@ -744,6 +1334,12 @@ def main():
         h["open"](a.app, [x for x in a.args if x != "--"])
     elif a.action == "quit":
         h["quit"](a.app, a.force)
+    elif a.action == "see":
+        h["see"](a.app, a.output)
+    elif a.action == "type":
+        h["type"](a.app, a.text)
+    elif a.action == "key":
+        h["key"](a.app, a.key)
     else:
         h[a.action](a.app)
 
