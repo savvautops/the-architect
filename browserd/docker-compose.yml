@@ -1,0 +1,12 @@
+services:
+  browserd:
+    build: .
+    ports:
+      - "8901:8901"
+    environment:
+      BROWSERD_PORT: 8901
+      BROWSERD_TOKEN: ${BROWSERD_TOKEN:?set BROWSERD_TOKEN in .env}
+      BROWSERD_PROFILE: /app/profile
+    volumes:
+      - ./profile:/app/profile
+    restart: unless-stopped
