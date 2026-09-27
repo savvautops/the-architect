@@ -43,84 +43,294 @@ def run(cmd, **kw):
 
 
 # ---------------------------------------------------------------- Windows ----
+if OS == "Windows":
+    import ctypes
+    from ctypes import wintypes
+    import time
+
+    _user32 = ctypes.windll.user32
+    _kernel32 = ctypes.windll.kernel32
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    PROCESS_TERMINATE = 0x0001
+    WM_CLOSE = 0x0010
+    SW_RESTORE = 9
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    _DESKTOPENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.LPWSTR, wintypes.LPARAM)
+
+    _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    _user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    _user32.BringWindowToTop.argtypes = [wintypes.HWND]
+    _user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    _user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    _user32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _user32.OpenDesktopW.restype = wintypes.HANDLE
+    _user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    _user32.EnumDesktopWindows.argtypes = [wintypes.HANDLE, _WNDENUMPROC, wintypes.LPARAM]
+    _user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
+    _user32.EnumDesktopsW.argtypes = [wintypes.HANDLE, _DESKTOPENUMPROC, wintypes.LPARAM]
+
+
 def _ps(script):
     return run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script])
 
 
+def _win_all_processes():
+    """Return list of dicts: [{'pid': int, 'name': str}] for all running processes."""
+    hSnap = _kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if hSnap == -1 or hSnap == 0:
+        return []
+    pe = _PROCESSENTRY32W()
+    pe.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+    procs = []
+    if _kernel32.Process32FirstW(hSnap, ctypes.byref(pe)):
+        while True:
+            procs.append({"pid": pe.th32ProcessID, "name": pe.szExeFile})
+            if not _kernel32.Process32NextW(hSnap, ctypes.byref(pe)):
+                break
+    _kernel32.CloseHandle(hSnap)
+    return procs
+
+
+def _win_visible_windows():
+    """Return list of dicts: [{'hwnd': int, 'pid': int, 'title': str}] for visible titled windows."""
+    windows = []
+    h_winsta = _user32.GetProcessWindowStation()
+    desktop_names = []
+
+    def desk_cb(lpszDesktop, lparam):
+        desktop_names.append(lpszDesktop)
+        return 1
+
+    _user32.EnumDesktopsW(h_winsta, _DESKTOPENUMPROC(desk_cb), 0)
+    if not desktop_names:
+        desktop_names = ["Default"]
+
+    def make_cb(desk_windows):
+        def wnd_cb(hwnd, lparam):
+            if not _user32.IsWindowVisible(hwnd):
+                return 1
+            length = _user32.GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return 1
+            buff = ctypes.create_unicode_buffer(length + 1)
+            _user32.GetWindowTextW(hwnd, buff, length + 1)
+            title = buff.value.strip()
+            if not title:
+                return 1
+            pid = wintypes.DWORD()
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            desk_windows.append({"hwnd": hwnd, "pid": pid.value, "title": title})
+            return 1
+        return _WNDENUMPROC(wnd_cb)
+
+    for dname in desktop_names:
+        h_desk = _user32.OpenDesktopW(dname, 0, False, 0x01FF)
+        if h_desk:
+            desk_windows = []
+            cb = make_cb(desk_windows)
+            _user32.EnumDesktopWindows(h_desk, cb, 0)
+            _user32.CloseDesktop(h_desk)
+            windows.extend(desk_windows)
+
+    cb = make_cb(windows)
+    _user32.EnumWindows(cb, 0)
+
+    seen = set()
+    dedup = []
+    for w in windows:
+        if w["hwnd"] not in seen:
+            seen.add(w["hwnd"])
+            dedup.append(w)
+    return dedup
+
+
+def _win_match_procs(app):
+    """Find processes matching app name (case-insensitive, with/without .exe)."""
+    target = app.lower()
+    if target.endswith(".exe"):
+        target = target[:-4]
+    matches = []
+    for p in _win_all_processes():
+        pname = p["name"].lower()
+        pbase = pname[:-4] if pname.endswith(".exe") else pname
+        if (
+            pbase == target
+            or pbase.startswith(f"{target}64")
+            or pbase.startswith(f"{target}32")
+            or pbase.startswith(f"{target}-")
+            or pbase.startswith(f"{target}_")
+            or (len(target) >= 3 and pbase.startswith(target))
+        ):
+            matches.append(p)
+    return matches
+
+
 def win_open(app, args):
-    arg_str = " ".join(f"'{a}'" for a in args)
-    extra = f" -ArgumentList {arg_str}" if arg_str else ""
-    rc, out = _ps(f"Start-Process -FilePath '{app}'{extra} -PassThru | Select-Object -ExpandProperty Id")
-    if rc != 0 or not out.isdigit():
-        return fail("open", f"could not start '{app}'", detail=out)
-    return emit({"ok": True, "action": "open", "app": app, "evidence": {"pid": int(out)}})
+    binary = shutil.which(app) or shutil.which(f"{app}.exe") or app
+    try:
+        p = subprocess.Popen(
+            [binary] + args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return emit({"ok": True, "action": "open", "app": app, "evidence": {"pid": p.pid}})
+    except OSError:
+        arg_str = " ".join(f"'{a}'" for a in args)
+        extra = f" -ArgumentList {arg_str}" if arg_str else ""
+        rc, out = _ps(f"Start-Process -FilePath '{app}'{extra} -PassThru | Select-Object -ExpandProperty Id")
+        if rc != 0 or not out.isdigit():
+            return fail("open", f"could not start '{app}'", detail=out)
+        return emit({"ok": True, "action": "open", "app": app, "evidence": {"pid": int(out)}})
 
 
 def win_status(app):
-    name = app[:-4] if app.lower().endswith(".exe") else app
-    rc, out = _ps(
-        f"Get-Process -Name '{name}' -ErrorAction SilentlyContinue | "
-        "Select-Object Id, ProcessName, MainWindowTitle | ConvertTo-Json -Compress"
-    )
-    if rc != 0 or not out or out == "null":
+    procs = _win_match_procs(app)
+    windows = _win_visible_windows()
+
+    if not procs:
+        app_lower = (app[:-4] if app.lower().endswith(".exe") else app).lower()
+        matching_hwnds = [w for w in windows if app_lower in w["title"].lower()]
+        if matching_hwnds:
+            all_p = {p["pid"]: p["name"] for p in _win_all_processes()}
+            procs = [{"pid": w["pid"], "name": all_p.get(w["pid"], app)} for w in matching_hwnds]
+
+    if not procs:
         return emit({"ok": True, "action": "status", "app": app,
                      "evidence": {"running": False}})
-    procs = json.loads(out)
-    if isinstance(procs, dict):
-        procs = [procs]
+
+    w_map = {}
+    for w in windows:
+        if w["pid"] not in w_map:
+            w_map[w["pid"]] = w["title"]
+
+    app_lower = (app[:-4] if app.lower().endswith(".exe") else app).lower()
+    if not any(w_map.get(p["pid"]) for p in procs):
+        for w in windows:
+            if app_lower in w["title"].lower():
+                w_map[procs[0]["pid"]] = w["title"]
+                break
+
+    proc_list = [
+        {"pid": p["pid"], "name": p["name"], "window": w_map.get(p["pid"], "")}
+        for p in procs
+    ]
     return emit({"ok": True, "action": "status", "app": app, "evidence": {
-        "running": True,
-        "processes": [{"pid": p["Id"], "name": p["ProcessName"],
-                       "window": p.get("MainWindowTitle") or ""} for p in procs]}})
+        "running": True, "processes": proc_list}})
 
 
 def win_list():
-    rc, out = _ps(
-        "Get-Process | Where-Object {$_.MainWindowTitle} | "
-        "Select-Object Id, ProcessName, MainWindowTitle | ConvertTo-Json -Compress"
-    )
-    procs = json.loads(out) if out and out != "null" else []
-    if isinstance(procs, dict):
-        procs = [procs]
+    windows = _win_visible_windows()
+    all_procs = {p["pid"]: p["name"] for p in _win_all_processes()}
+    results = []
+    seen = set()
+    for w in windows:
+        pid = w["pid"]
+        if pid in seen:
+            continue
+        seen.add(pid)
+        results.append({
+            "pid": pid,
+            "name": all_procs.get(pid, ""),
+            "window": w["title"],
+        })
     emit({"ok": True, "action": "list", "evidence": {
-        "count": len(procs),
-        "processes": [{"pid": p["Id"], "name": p["ProcessName"],
-                       "window": p.get("MainWindowTitle") or ""} for p in procs]}})
+        "count": len(results),
+        "processes": results}})
 
 
 def win_focus(app):
-    name = app[:-4] if app.lower().endswith(".exe") else app
-    script = (
-        "Add-Type @'\n"
-        "using System; using System.Runtime.InteropServices;\n"
-        "public class W { [DllImport(\"user32.dll\")] "
-        "public static extern bool SetForegroundWindow(IntPtr h); }'@\n"
-        f"$p = Get-Process -Name '{name}' -ErrorAction SilentlyContinue | "
-        "Where-Object {$_.MainWindowHandle -ne 0} | Select-Object -First 1\n"
-        "if ($p) { [W]::SetForegroundWindow($p.MainWindowHandle); 'focused' } else { 'notfound' }"
-    )
-    rc, out = _ps(script)
-    if out != "focused":
+    app_lower = (app[:-4] if app.lower().endswith(".exe") else app).lower()
+    procs = _win_match_procs(app)
+    pids = {p["pid"] for p in procs}
+
+    target_hwnd = None
+    windows = _win_visible_windows()
+
+    for w in windows:
+        if w["pid"] in pids:
+            target_hwnd = w["hwnd"]
+            break
+
+    if not target_hwnd:
+        for w in windows:
+            if app_lower in w["title"].lower():
+                target_hwnd = w["hwnd"]
+                break
+
+    if not target_hwnd:
         return fail("focus", f"no visible window for '{app}'")
+
+    _user32.ShowWindow(target_hwnd, SW_RESTORE)
+    fore_wnd = _user32.GetForegroundWindow()
+    fore_tid = _user32.GetWindowThreadProcessId(fore_wnd, None)
+    cur_tid = _kernel32.GetCurrentThreadId()
+    if fore_tid != cur_tid:
+        _user32.AttachThreadInput(cur_tid, fore_tid, True)
+    _user32.BringWindowToTop(target_hwnd)
+    _user32.SetForegroundWindow(target_hwnd)
+    if fore_tid != cur_tid:
+        _user32.AttachThreadInput(cur_tid, fore_tid, False)
+
     return emit({"ok": True, "action": "focus", "app": app,
                  "evidence": {"foreground": True}})
 
 
 def win_quit(app, force):
-    name = app[:-4] if app.lower().endswith(".exe") else app
+    app_lower = (app[:-4] if app.lower().endswith(".exe") else app).lower()
+    procs = _win_match_procs(app)
+    if not procs:
+        return emit({"ok": True, "action": "quit", "app": app,
+                     "evidence": {"running": False, "method": "already-closed"}})
+
+    pids = [p["pid"] for p in procs]
+
     if not force:
-        _ps(f"(Get-Process -Name '{name}' -ErrorAction SilentlyContinue).CloseMainWindow()")
-        import time
-        for _ in range(10):
-            time.sleep(0.5)
-            rc, out = _ps(f"@(Get-Process -Name '{name}' -ErrorAction SilentlyContinue).Count")
-            if out in ("0", ""):
+        windows = _win_visible_windows()
+        target_hwnds = [w["hwnd"] for w in windows if w["pid"] in pids]
+        if not target_hwnds:
+            target_hwnds = [w["hwnd"] for w in windows if app_lower in w["title"].lower()]
+
+        for hwnd in target_hwnds:
+            _user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+
+        for _ in range(15):
+            time.sleep(0.2)
+            alive = [p for p in _win_all_processes() if p["pid"] in pids]
+            if not alive:
                 return emit({"ok": True, "action": "quit", "app": app,
                              "evidence": {"running": False, "method": "graceful"}})
-    rc, out = _ps(f"Stop-Process -Name '{name}' -Force -ErrorAction SilentlyContinue; 'done'")
+
+    for pid in pids:
+        hProc = _kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if hProc:
+            _kernel32.TerminateProcess(hProc, 1)
+            _kernel32.CloseHandle(hProc)
+
+    time.sleep(0.2)
+    still_alive = [p for p in _win_all_processes() if p["pid"] in pids]
     return emit({"ok": True, "action": "quit", "app": app,
                  "evidence": {"running": False,
-                              "method": "force" if force else "graceful-timeout-force" }})
+                              "method": "force" if force else "graceful-timeout-force"}})
 
 
 # ------------------------------------------------------------------ macOS ----
