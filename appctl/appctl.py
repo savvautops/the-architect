@@ -193,7 +193,27 @@ def win_open(app, args):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return emit({"ok": True, "action": "open", "app": app, "evidence": {"pid": p.pid}})
+        # Verify: a spawned PID is not a running app. Wait for a visible
+        # window owned by the process; report what actually appeared.
+        window_title = ""
+        alive = True
+        for _ in range(30):
+            time.sleep(0.1)
+            if p.poll() is not None:
+                alive = False
+                break
+            for w in _win_visible_windows():
+                if w["pid"] == p.pid:
+                    window_title = w["title"]
+                    break
+            if window_title:
+                break
+        if not alive:
+            return fail("open", f"'{app}' exited immediately (code {p.returncode})",
+                        evidence={"pid": p.pid})
+        return emit({"ok": True, "action": "open", "app": app,
+                     "evidence": {"pid": p.pid, "verified": True,
+                                  "window": window_title}})
     except OSError:
         arg_str = " ".join(f"'{a}'" for a in args)
         extra = f" -ArgumentList {arg_str}" if arg_str else ""
@@ -281,6 +301,7 @@ def win_focus(app):
         return fail("focus", f"no visible window for '{app}'")
 
     _user32.ShowWindow(target_hwnd, SW_RESTORE)
+    _user32.GetForegroundWindow.restype = wintypes.HWND
     fore_wnd = _user32.GetForegroundWindow()
     fore_tid = _user32.GetWindowThreadProcessId(fore_wnd, None)
     cur_tid = _kernel32.GetCurrentThreadId()
@@ -291,8 +312,18 @@ def win_focus(app):
     if fore_tid != cur_tid:
         _user32.AttachThreadInput(cur_tid, fore_tid, False)
 
-    return emit({"ok": True, "action": "focus", "app": app,
-                 "evidence": {"foreground": True}})
+    # Verify: the call being sent is not success. Poll until the target
+    # actually owns the foreground, then report what we observed.
+    for _ in range(10):
+        time.sleep(0.1)
+        if _user32.GetForegroundWindow() == target_hwnd:
+            return emit({"ok": True, "action": "focus", "app": app,
+                         "evidence": {"foreground": True, "verified": True}})
+    actual = _user32.GetForegroundWindow()
+    return fail("focus", f"window did not come to foreground for '{app}'",
+                evidence={"foreground": False,
+                          "expected_hwnd": target_hwnd,
+                          "actual_hwnd": actual})
 
 
 def win_quit(app, force):
