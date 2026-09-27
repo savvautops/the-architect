@@ -29,6 +29,15 @@ import sys
 import time
 import zlib
 
+try:
+    from appctl.registry import registry, SchemaValidationError
+except ImportError:
+    try:
+        from registry import registry, SchemaValidationError
+    except ImportError:
+        registry = None
+        SchemaValidationError = Exception
+
 OS = platform.system()  # Windows | Darwin | Linux
 
 
@@ -708,12 +717,7 @@ def win_see(app, output_path=None):
     })
 
 
-def win_type(app, text):
-    _win_attach_desktop()
-    target = _win_resolve_target(app)
-    if not target:
-        return fail("type", f"no visible window for '{app}'")
-
+def _win_type_raw(target, text):
     _win_focus_window(target["hwnd"])
     time.sleep(0.05)
 
@@ -745,7 +749,16 @@ def win_type(app, text):
             _user32.SendInput(2, inputs, ctypes.sizeof(INPUT))
         chars_sent += 1
         time.sleep(0.01)
+    return chars_sent
 
+
+def win_type(app, text):
+    _win_attach_desktop()
+    target = _win_resolve_target(app)
+    if not target:
+        return fail("type", f"no visible window for '{app}'")
+
+    chars_sent = _win_type_raw(target, text)
     return emit({
         "ok": True,
         "action": "type",
@@ -759,12 +772,7 @@ def win_type(app, text):
     })
 
 
-def win_key(app, key_name):
-    _win_attach_desktop()
-    target = _win_resolve_target(app)
-    if not target:
-        return fail("key", f"no visible window for '{app}'")
-
+def _win_key_raw(target, key_name):
     _win_focus_window(target["hwnd"])
     time.sleep(0.05)
 
@@ -794,7 +802,7 @@ def win_key(app, key_name):
         if len(actual_key) == 1:
             vk = ord(actual_key.upper())
         else:
-            return fail("key", f"unsupported key: '{key_name}'")
+            raise ValueError(f"unsupported key: '{key_name}'")
 
     def key_event(v, up=False):
         flags = 0x0002 if up else 0
@@ -811,6 +819,18 @@ def win_key(app, key_name):
     if alt: key_event(0x12, True)
     if shift: key_event(0x10, True)
     if ctrl: key_event(0x11, True)
+
+
+def win_key(app, key_name):
+    _win_attach_desktop()
+    target = _win_resolve_target(app)
+    if not target:
+        return fail("key", f"no visible window for '{app}'")
+
+    try:
+        _win_key_raw(target, key_name)
+    except ValueError as e:
+        return fail("key", str(e))
 
     return emit({
         "ok": True,
@@ -1262,6 +1282,7 @@ HANDLERS = {
         "open": win_open, "focus": win_focus, "status": win_status,
         "list": lambda: win_list(), "quit": win_quit,
         "see": win_see, "type": win_type, "key": win_key,
+        "resolve": _win_resolve_target, "type_raw": _win_type_raw, "key_raw": _win_key_raw,
     },
     "Darwin": {
         "open": mac_open, "focus": mac_focus, "status": mac_status,
@@ -1276,10 +1297,120 @@ HANDLERS = {
 }
 
 
+def run_tools(app_filter=None):
+    if not registry:
+        return fail("tools", "registry module not available")
+    tools = registry.list_tools(app_filter)
+    return emit({
+        "ok": True,
+        "action": "tools",
+        "filter": app_filter,
+        "count": len(tools),
+        "tools": tools,
+    })
+
+
+def run_schema(tool_id):
+    if not registry:
+        return fail("schema", "registry module not available")
+    tool = registry.get(tool_id)
+    if not tool:
+        return fail("schema", f"unregistered tool: '{tool_id}'")
+    return emit({
+        "ok": True,
+        "action": "schema",
+        "tool_id": tool_id,
+        "tool": tool,
+    })
+
+
+def run_exec(tool_id, args_json_str=None):
+    if not registry:
+        return fail("exec", "registry module not available")
+
+    args = {}
+    if args_json_str:
+        try:
+            args = json.loads(args_json_str)
+        except Exception as e:
+            return fail("exec", f"invalid JSON in --args-json: {e}")
+
+    try:
+        tool, validated_args = registry.validate_and_prepare(tool_id, args)
+    except KeyError:
+        return fail("exec", f"unregistered tool: '{tool_id}'")
+    except SchemaValidationError as e:
+        return fail("exec", f"schema validation failed for '{tool_id}': {e}")
+
+    h = HANDLERS.get(OS)
+    if not h:
+        return fail("exec", f"unsupported OS: {OS}")
+
+    action = tool.get("action")
+    target_app = validated_args.get("app")
+
+    if action == "open":
+        return h["open"](validated_args["app"], validated_args.get("args", []))
+    elif action == "focus":
+        return h["focus"](validated_args["app"])
+    elif action == "see":
+        return h["see"](validated_args["app"], validated_args.get("output"))
+    elif action == "diff":
+        return run_diff(
+            validated_args["before"],
+            validated_args["after"],
+            validated_args.get("region"),
+            validated_args.get("mask"),
+            validated_args.get("threshold", 0.001),
+        )
+    elif action == "type":
+        return h["type"](validated_args["app"], validated_args["text"])
+    elif action == "key":
+        key_val = validated_args.get("key") or tool.get("params", {}).get("key")
+        return h["key"](validated_args["app"], key_val)
+    elif action == "status":
+        return h["status"](validated_args["app"])
+    elif action == "list":
+        return h["list"]()
+    elif action == "quit":
+        return h["quit"](validated_args["app"], validated_args.get("force", False))
+    elif action == "macro":
+        steps = tool.get("params", {}).get("steps", [])
+        if "type_raw" in h and "key_raw" in h and "resolve" in h:
+            target = h["resolve"](target_app)
+            if not target:
+                return fail("exec", f"no visible window for '{target_app}'")
+            completed = 0
+            for step in steps:
+                s_action = step.get("action")
+                if s_action == "key":
+                    h["key_raw"](target, step.get("key"))
+                elif s_action == "type":
+                    tpl = step.get("text_template", "")
+                    text = tpl.format(**validated_args)
+                    h["type_raw"](target, text)
+                time.sleep(0.05)
+                completed += 1
+            return emit({
+                "ok": True,
+                "action": "exec",
+                "tool_id": tool_id,
+                "evidence": {
+                    "macro_steps_completed": completed,
+                    "app": target_app,
+                    "window": target["title"],
+                }
+            })
+        else:
+            return fail("exec", f"macro execution not supported on OS: {OS}")
+    else:
+        return fail("exec", f"unknown action '{action}' for tool '{tool_id}'")
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="appctl",
-        description="Cross-platform app lifecycle & observation adapter (The Architect v0.2)",
+        description="Cross-platform app lifecycle, observation & tool registry adapter (The Architect v0.3)",
     )
     sub = ap.add_subparsers(dest="action", required=True)
 
@@ -1318,10 +1449,29 @@ def main():
     p.add_argument("app")
     p.add_argument("--force", action="store_true", help="kill instead of asking nicely")
 
+    p = sub.add_parser("tools", help="list registered tools and schemas")
+    p.add_argument("app", nargs="?", default=None, help="optional app name to filter")
+
+    p = sub.add_parser("schema", help="display JSON schema for a registered tool")
+    p.add_argument("tool_id", help="tool identifier (e.g. editor.save_all)")
+
+    p = sub.add_parser("exec", help="validate arguments and execute a registered tool")
+    p.add_argument("tool_id", help="tool identifier (e.g. editor.save_all)")
+    p.add_argument("--args-json", default=None, help="JSON arguments matching tool schema")
+
     a = ap.parse_args()
 
     if a.action == "diff":
         run_diff(a.before, a.after, a.region, a.mask, a.threshold)
+        return
+    elif a.action == "tools":
+        run_tools(a.app)
+        return
+    elif a.action == "schema":
+        run_schema(a.tool_id)
+        return
+    elif a.action == "exec":
+        run_exec(a.tool_id, a.args_json)
         return
 
     h = HANDLERS.get(OS)
