@@ -230,6 +230,113 @@ SEED_REGISTRY: List[Dict[str, Any]] = [
         "expect": {"postconditions": ["process_terminated"]},
         "risk": "medium"
     },
+    {
+        "tool_id": "app.macro_node",
+        "app": "system",
+        "action": "node",
+        "inputs": {
+            "type": "object",
+            "properties": {
+                "app": {"type": "string", "description": "Target application name, title, or PID"},
+                "id": {"type": "string", "description": "Macro-node workflow identifier"},
+                "preconditions": {
+                    "type": "object",
+                    "properties": {
+                        "focused": {"type": "boolean", "description": "Require target application to be focused"},
+                        "title_match": {"type": "string", "description": "Regex pattern window title must match"},
+                        "see": {"type": "boolean", "description": "Capture baseline screenshot before execution"}
+                    }
+                },
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["key", "type", "click", "sleep"]},
+                            "key": {"type": "string"},
+                            "text": {"type": "string"},
+                            "text_template": {"type": "string"},
+                            "x": {"type": "integer"},
+                            "y": {"type": "integer"},
+                            "button": {"type": "string", "enum": ["left", "right", "double"]},
+                            "duration": {"type": "number"}
+                        },
+                        "required": ["action"]
+                    },
+                    "description": "Sequence of typed workflow steps"
+                },
+                "postconditions": {
+                    "type": "object",
+                    "properties": {
+                        "focused": {"type": "boolean", "description": "Verify target application is focused after execution"},
+                        "title_match": {"type": "string", "description": "Regex pattern window title must match after execution"},
+                        "assert_changed": {"type": "boolean", "description": "Assert visual pixels changed"},
+                        "assert_unchanged": {"type": "boolean", "description": "Assert visual pixels remained unchanged"},
+                        "diff": {"type": "object"}
+                    }
+                },
+                "recovery": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Fallback steps to execute if execution or verification fails"
+                }
+            },
+            "required": ["app", "steps"]
+        },
+        "expect": {"postconditions": ["preconditions_verified", "steps_dispatched", "postconditions_verified"]},
+        "risk": "medium"
+    },
+    {
+        "tool_id": "a11y.tree",
+        "app": "system",
+        "action": "a11y_tree",
+        "inputs": {
+            "type": "object",
+            "properties": {
+                "app": {"type": "string", "description": "Target application name, title, or PID"},
+                "depth": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Max hierarchy depth (default: 3)"},
+                "max_children": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Max child elements per node (default: 25)"}
+            },
+            "required": ["app"]
+        },
+        "expect": {"postconditions": ["semantic_tree_enumerated"]},
+        "risk": "low"
+    },
+    {
+        "tool_id": "a11y.query",
+        "app": "system",
+        "action": "a11y_query",
+        "inputs": {
+            "type": "object",
+            "properties": {
+                "app": {"type": "string", "description": "Target application name, title, or PID"},
+                "role": {"type": "string", "description": "Control role filter (e.g. 'button', 'edit', 'menu item')"},
+                "name": {"type": "string", "description": "Element name regex or substring filter"},
+                "id": {"type": "string", "description": "Automation ID regex or substring filter"}
+            },
+            "required": ["app"]
+        },
+        "expect": {"postconditions": ["matching_elements_found"]},
+        "risk": "low"
+    },
+    {
+        "tool_id": "a11y.click",
+        "app": "system",
+        "action": "a11y_click",
+        "inputs": {
+            "type": "object",
+            "properties": {
+                "app": {"type": "string", "description": "Target application name, title, or PID"},
+                "role": {"type": "string", "description": "Control role filter (e.g. 'button')"},
+                "name": {"type": "string", "description": "Element name regex or substring filter"},
+                "id": {"type": "string", "description": "Automation ID regex or substring filter"},
+                "button": {"type": "string", "enum": ["left", "right", "double"], "description": "Mouse button action (default: left)"}
+            },
+            "required": ["app"]
+        },
+        "expect": {"postconditions": ["element_clicked"]},
+        "risk": "medium"
+    },
 
     # ----------------------------------------------------------- editor tools -
     {

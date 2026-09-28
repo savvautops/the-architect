@@ -38,6 +38,22 @@ except ImportError:
         registry = None
         SchemaValidationError = Exception
 
+try:
+    from appctl.node import execute_macro_node
+except ImportError:
+    try:
+        from node import execute_macro_node
+    except ImportError:
+        execute_macro_node = None
+
+try:
+    from appctl.a11y import run_a11y_tree, run_a11y_query, run_a11y_click
+except ImportError:
+    try:
+        from a11y import run_a11y_tree, run_a11y_query, run_a11y_click
+    except ImportError:
+        run_a11y_tree = run_a11y_query = run_a11y_click = None
+
 OS = platform.system()  # Windows | Darwin | Linux
 
 
@@ -685,12 +701,7 @@ def win_focus(app):
     )
 
 
-def win_see(app, output_path=None):
-    _win_attach_desktop()
-    target = _win_resolve_target(app)
-    if not target:
-        return fail("see", f"no visible window for '{app}'")
-
+def _win_see_raw(target, output_path=None):
     target_hwnd = target["hwnd"]
     target_pid = target["pid"]
     target_title = target["title"]
@@ -702,7 +713,7 @@ def win_see(app, output_path=None):
     width = rect.right - rect.left
     height = rect.bottom - rect.top
     if width <= 0 or height <= 0:
-        return fail("see", f"invalid window geometry ({width}x{height}) for '{app}'")
+        raise ValueError(f"invalid window geometry ({width}x{height}) for '{target_title}'")
 
     hdc_screen = _user32.GetDC(0)
     hdc_mem = _gdi32.CreateCompatibleDC(hdc_screen)
@@ -737,7 +748,7 @@ def win_see(app, output_path=None):
     png_bytes = encode_png_rgb(width, height, rgb_data)
 
     if not output_path:
-        clean_app = "".join(c for c in app if c.isalnum() or c in ("-", "_"))
+        clean_app = "".join(c for c in target_title if c.isalnum() or c in ("-", "_")) or "target"
         out_dir = os.path.join(os.environ.get("TEMP", "."), "appctl_see")
         os.makedirs(out_dir, exist_ok=True)
         output_path = os.path.join(out_dir, f"{clean_app}_{int(time.time() * 1000)}.png")
@@ -745,18 +756,32 @@ def win_see(app, output_path=None):
     with open(output_path, "wb") as f:
         f.write(png_bytes)
 
+    return {
+        "path": os.path.abspath(output_path),
+        "geometry": {"x": rect.left, "y": rect.top, "w": width, "h": height},
+        "pid": target_pid,
+        "hwnd": target_hwnd,
+        "window": target_title,
+        "size_bytes": len(png_bytes),
+    }
+
+
+def win_see(app, output_path=None):
+    _win_attach_desktop()
+    target = _win_resolve_target(app)
+    if not target:
+        return fail("see", f"no visible window for '{app}'")
+
+    try:
+        ev = _win_see_raw(target, output_path)
+    except ValueError as e:
+        return fail("see", str(e))
+
     return emit({
         "ok": True,
         "action": "see",
         "app": app,
-        "evidence": {
-            "path": os.path.abspath(output_path),
-            "geometry": {"x": rect.left, "y": rect.top, "w": width, "h": height},
-            "pid": target_pid,
-            "hwnd": target_hwnd,
-            "window": target_title,
-            "size_bytes": len(png_bytes),
-        }
+        "evidence": ev
     })
 
 
@@ -1425,7 +1450,7 @@ HANDLERS = {
         "list": lambda: win_list(), "quit": win_quit,
         "see": win_see, "type": win_type, "key": win_key, "click": win_click,
         "resolve": _win_resolve_target, "type_raw": _win_type_raw, "key_raw": _win_key_raw,
-        "click_raw": _win_click_raw,
+        "click_raw": _win_click_raw, "focus_raw": _win_focus_window, "see_raw": _win_see_raw,
     },
     "Darwin": {
         "open": mac_open, "focus": mac_focus, "status": mac_status,
@@ -1519,6 +1544,46 @@ def run_exec(tool_id, args_json_str=None):
         return h["list"]()
     elif action == "quit":
         return h["quit"](validated_args["app"], validated_args.get("force", False))
+    elif action == "node":
+        if not execute_macro_node:
+            return fail("exec", "macro_node module not available")
+        res = execute_macro_node(validated_args, h, diff_fn=compute_diff)
+        return emit(res, code=0 if res.get("ok") else 1)
+    elif action == "a11y_tree":
+        if not run_a11y_tree:
+            return fail("exec", "a11y module not available")
+        res = run_a11y_tree(
+            validated_args["app"],
+            depth=validated_args.get("depth", 3),
+            max_children=validated_args.get("max_children", 25),
+            resolve_fn=h.get("resolve"),
+        )
+        return emit(res, code=0 if res.get("ok") else 1)
+    elif action == "a11y_query":
+        if not run_a11y_query:
+            return fail("exec", "a11y module not available")
+        res = run_a11y_query(
+            validated_args["app"],
+            role=validated_args.get("role"),
+            name=validated_args.get("name"),
+            automation_id=validated_args.get("id"),
+            resolve_fn=h.get("resolve"),
+        )
+        return emit(res, code=0 if res.get("ok") else 1)
+    elif action == "a11y_click":
+        if not run_a11y_click:
+            return fail("exec", "a11y module not available")
+        res = run_a11y_click(
+            validated_args["app"],
+            role=validated_args.get("role"),
+            name=validated_args.get("name"),
+            automation_id=validated_args.get("id"),
+            button=validated_args.get("button", "left"),
+            resolve_fn=h.get("resolve"),
+            click_fn=h.get("click_raw"),
+            focus_fn=h.get("focus_raw"),
+        )
+        return emit(res, code=0 if res.get("ok") else 1)
     elif action == "macro":
         steps = tool.get("params", {}).get("steps", [])
         if "type_raw" in h and "key_raw" in h and "resolve" in h:
@@ -1613,7 +1678,33 @@ def main():
     p.add_argument("tool_id", help="tool identifier (e.g. editor.save_all)")
     p.add_argument("--args-json", default=None, help="JSON arguments matching tool schema")
 
+    p = sub.add_parser("node", help="execute a verified macro-node contract")
+    p.add_argument("spec", help="spec JSON string or file path")
+    p.add_argument("--params-json", default=None, help="JSON parameters for text template interpolation")
+
+    p = sub.add_parser("tree", help="dump semantic desktop DOM / accessibility tree")
+    p.add_argument("app")
+    p.add_argument("--depth", type=int, default=3, help="max hierarchy depth (default: 3)")
+    p.add_argument("--max-children", type=int, default=25, help="max child nodes per parent (default: 25)")
+
+    p = sub.add_parser("query", help="query semantic accessibility elements by role, name, or id")
+    p.add_argument("app")
+    p.add_argument("--role", default=None, help="control type filter (e.g. 'button')")
+    p.add_argument("--name", default=None, help="element name regex/substring filter")
+    p.add_argument("--id", default=None, help="automation ID regex/substring filter")
+
+    p = sub.add_parser("a11y-click", help="click element semantically located by accessibility query")
+    p.add_argument("app")
+    p.add_argument("--role", default=None, help="control type filter (e.g. 'button')")
+    p.add_argument("--name", default=None, help="element name regex/substring filter")
+    p.add_argument("--id", default=None, help="automation ID regex/substring filter")
+    p.add_argument("--button", choices=["left", "right", "double"], default="left", help="mouse button action (default: left)")
+
     a = ap.parse_args()
+
+    h = HANDLERS.get(OS)
+    if not h:
+        fail(a.action, f"unsupported OS: {OS}")
 
     if a.action == "diff":
         run_diff(a.before, a.after, a.region, a.mask, a.threshold)
@@ -1627,10 +1718,40 @@ def main():
     elif a.action == "exec":
         run_exec(a.tool_id, a.args_json)
         return
-
-    h = HANDLERS.get(OS)
-    if not h:
-        fail(a.action, f"unsupported OS: {OS}")
+    elif a.action == "node":
+        if not execute_macro_node:
+            fail("node", "macro_node module not available")
+        params = json.loads(a.params_json) if a.params_json else None
+        res = execute_macro_node(a.spec, h, diff_fn=compute_diff, params=params)
+        emit(res, code=0 if res.get("ok") else 1)
+        return
+    elif a.action == "tree":
+        if not run_a11y_tree:
+            fail("tree", "a11y module not available")
+        res = run_a11y_tree(a.app, depth=a.depth, max_children=a.max_children, resolve_fn=h.get("resolve"))
+        emit(res, code=0 if res.get("ok") else 1)
+        return
+    elif a.action == "query":
+        if not run_a11y_query:
+            fail("query", "a11y module not available")
+        res = run_a11y_query(a.app, role=a.role, name=a.name, automation_id=a.id, resolve_fn=h.get("resolve"))
+        emit(res, code=0 if res.get("ok") else 1)
+        return
+    elif a.action == "a11y-click":
+        if not run_a11y_click:
+            fail("a11y-click", "a11y module not available")
+        res = run_a11y_click(
+            a.app,
+            role=a.role,
+            name=a.name,
+            automation_id=a.id,
+            button=a.button,
+            resolve_fn=h.get("resolve"),
+            click_fn=h.get("click_raw"),
+            focus_fn=h.get("focus_raw"),
+        )
+        emit(res, code=0 if res.get("ok") else 1)
+        return
 
     if a.action == "list":
         h["list"]()
