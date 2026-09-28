@@ -174,6 +174,23 @@ SEED_REGISTRY: List[Dict[str, Any]] = [
         "risk": "medium"
     },
     {
+        "tool_id": "app.click",
+        "app": "system",
+        "action": "click",
+        "inputs": {
+            "type": "object",
+            "properties": {
+                "app": {"type": "string", "description": "Target application name, title, or PID"},
+                "x": {"type": "integer", "description": "X coordinate relative to window top-left"},
+                "y": {"type": "integer", "description": "Y coordinate relative to window top-left"},
+                "button": {"type": "string", "enum": ["left", "right", "double"], "description": "Mouse button action (default: left)"}
+            },
+            "required": ["app", "x", "y"]
+        },
+        "expect": {"postconditions": ["mouse_click_dispatched"]},
+        "risk": "medium"
+    },
+    {
         "tool_id": "app.status",
         "app": "system",
         "action": "status",

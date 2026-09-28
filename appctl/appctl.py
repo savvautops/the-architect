@@ -208,6 +208,15 @@ if OS == "Windows":
     _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
     _user32.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
     _user32.SendInput.restype = wintypes.UINT
+    _user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    _user32.SetCursorPos.restype = wintypes.BOOL
+    _user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_ulong]
+    _user32.mouse_event.restype = None
+
+    try:
+        _user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
     _gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
     _gdi32.CreateCompatibleDC.restype = wintypes.HDC
@@ -779,7 +788,8 @@ def _win_key_raw(target, key_name):
     VK_MAP = {
         "enter": 0x0D, "return": 0x0D, "tab": 0x09, "escape": 0x1B, "esc": 0x1B,
         "backspace": 0x08, "space": 0x20, "up": 0x26, "down": 0x28, "left": 0x25,
-        "right": 0x27, "delete": 0x2E, "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22
+        "right": 0x27, "delete": 0x2E, "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+        **{f"f{i}": 0x6F + i for i in range(1, 13)}
     }
 
     key_lower = key_name.lower()
@@ -806,7 +816,8 @@ def _win_key_raw(target, key_name):
 
     def key_event(v, up=False):
         flags = 0x0002 if up else 0
-        _user32.keybd_event(v, 0, flags, 0)
+        scan = _user32.MapVirtualKeyW(v, 0)
+        _user32.keybd_event(v, scan, flags, 0)
 
     if ctrl: key_event(0x11, False)
     if shift: key_event(0x10, False)
@@ -839,6 +850,69 @@ def win_key(app, key_name):
         "evidence": {
             "sent": True,
             "key": key_name,
+            "pid": target["pid"],
+            "window": target["title"],
+        }
+    })
+
+
+def _win_click_raw(target, x, y, button="left"):
+    _win_focus_window(target["hwnd"])
+    time.sleep(0.05)
+
+    rect = RECT()
+    if _dwmapi.DwmGetWindowAttribute(target["hwnd"], 9, ctypes.byref(rect), ctypes.sizeof(RECT)) != 0:
+        _user32.GetWindowRect(target["hwnd"], ctypes.byref(rect))
+
+    screen_x = rect.left + int(x)
+    screen_y = rect.top + int(y)
+
+    _user32.SetCursorPos(screen_x, screen_y)
+    time.sleep(0.02)
+
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP = 0x0004
+    MOUSEEVENTF_RIGHTDOWN = 0x0008
+    MOUSEEVENTF_RIGHTUP = 0x0010
+
+    if button == "left":
+        _user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.02)
+        _user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    elif button == "right":
+        _user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
+        time.sleep(0.02)
+        _user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+    elif button == "double":
+        _user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.02)
+        _user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        time.sleep(0.05)
+        _user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.02)
+        _user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+
+def win_click(app, x, y, button="left"):
+    _win_attach_desktop()
+    target = _win_resolve_target(app)
+    if not target:
+        return fail("click", f"no visible window for '{app}'")
+
+    try:
+        _win_click_raw(target, x, y, button)
+    except Exception as e:
+        return fail("click", str(e))
+
+    return emit({
+        "ok": True,
+        "action": "click",
+        "app": app,
+        "evidence": {
+            "clicked": True,
+            "x": int(x),
+            "y": int(y),
+            "button": button,
             "pid": target["pid"],
             "window": target["title"],
         }
@@ -1167,6 +1241,10 @@ def mac_key(app, key_name):
     return emit({"ok": True, "action": "key", "app": app, "evidence": {"sent": True, "key": key_name}})
 
 
+def mac_click(app, x, y, button="left"):
+    return fail("click", "click action not yet implemented for macOS")
+
+
 # ------------------------------------------------------------------ Linux ----
 def lin_open(app, args):
     binary = shutil.which(app) or app
@@ -1276,23 +1354,33 @@ def lin_key(app, key_name):
     return fail("key", "no input tool (install xdotool)")
 
 
+def lin_click(app, x, y, button="left"):
+    if shutil.which("xdotool"):
+        btn = "1" if button == "left" else ("3" if button == "right" else "1 --repeat 2")
+        rc, out = run(["xdotool", "mousemove", str(x), str(y), "click", btn])
+        if rc == 0:
+            return emit({"ok": True, "action": "click", "app": app, "evidence": {"clicked": True, "x": int(x), "y": int(y), "button": button}})
+    return fail("click", "no input tool (install xdotool)")
+
+
 # ------------------------------------------------------------------ dispatch -
 HANDLERS = {
     "Windows": {
         "open": win_open, "focus": win_focus, "status": win_status,
         "list": lambda: win_list(), "quit": win_quit,
-        "see": win_see, "type": win_type, "key": win_key,
+        "see": win_see, "type": win_type, "key": win_key, "click": win_click,
         "resolve": _win_resolve_target, "type_raw": _win_type_raw, "key_raw": _win_key_raw,
+        "click_raw": _win_click_raw,
     },
     "Darwin": {
         "open": mac_open, "focus": mac_focus, "status": mac_status,
         "list": lambda: mac_status(""), "quit": mac_quit,
-        "see": mac_see, "type": mac_type, "key": mac_key,
+        "see": mac_see, "type": mac_type, "key": mac_key, "click": mac_click,
     },
     "Linux": {
         "open": lin_open, "focus": lin_focus, "status": lin_status,
         "list": lambda: lin_status(""), "quit": lin_quit,
-        "see": lin_see, "type": lin_type, "key": lin_key,
+        "see": lin_see, "type": lin_type, "key": lin_key, "click": lin_click,
     },
 }
 
@@ -1368,6 +1456,8 @@ def run_exec(tool_id, args_json_str=None):
     elif action == "key":
         key_val = validated_args.get("key") or tool.get("params", {}).get("key")
         return h["key"](validated_args["app"], key_val)
+    elif action == "click":
+        return h["click"](validated_args["app"], validated_args["x"], validated_args["y"], validated_args.get("button", "left"))
     elif action == "status":
         return h["status"](validated_args["app"])
     elif action == "list":
@@ -1389,6 +1479,9 @@ def run_exec(tool_id, args_json_str=None):
                     tpl = step.get("text_template", "")
                     text = tpl.format(**validated_args)
                     h["type_raw"](target, text)
+                elif s_action == "click":
+                    if "click_raw" in h:
+                        h["click_raw"](target, step["x"], step["y"], step.get("button", "left"))
                 time.sleep(0.05)
                 completed += 1
             return emit({
@@ -1440,6 +1533,12 @@ def main():
     p.add_argument("app")
     p.add_argument("key")
 
+    p = sub.add_parser("click", help="click at coordinates (x, y) relative to application window")
+    p.add_argument("app")
+    p.add_argument("x", type=int, help="X coordinate relative to window top-left")
+    p.add_argument("y", type=int, help="Y coordinate relative to window top-left")
+    p.add_argument("--button", choices=["left", "right", "double"], default="left", help="mouse button action (default: left)")
+
     p = sub.add_parser("status", help="is the app running? (pid, window)")
     p.add_argument("app")
 
@@ -1490,6 +1589,8 @@ def main():
         h["type"](a.app, a.text)
     elif a.action == "key":
         h["key"](a.app, a.key)
+    elif a.action == "click":
+        h["click"](a.app, a.x, a.y, a.button)
     else:
         h[a.action](a.app)
 

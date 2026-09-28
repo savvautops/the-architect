@@ -158,6 +158,19 @@ class TestCliRegistryCommands(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["action"], "list")
 
+    def test_cli_click_schema(self):
+        rc, out, _ = self.run_appctl("schema", "app.click")
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["tool_id"], "app.click")
+        self.assertEqual(out["tool"]["inputs"]["required"], ["app", "x", "y"])
+
+    def test_cli_exec_click_missing_coords(self):
+        rc, out, _ = self.run_appctl("exec", "app.click", "--args-json", '{"app": "notepad"}')
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["ok"])
+        self.assertIn("Missing required field", out["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
