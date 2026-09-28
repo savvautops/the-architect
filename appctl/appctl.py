@@ -150,6 +150,16 @@ if OS == "Windows":
             ("biClrImportant", wintypes.DWORD),
         ]
 
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", wintypes.LONG),
+            ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_void_p),
+        ]
+
     class KEYBDINPUT(ctypes.Structure):
         _fields_ = [
             ("wVk", wintypes.WORD),
@@ -159,10 +169,24 @@ if OS == "Windows":
             ("dwExtraInfo", ctypes.c_void_p),
         ]
 
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [
+            ("uMsg", wintypes.DWORD),
+            ("wParamL", wintypes.WORD),
+            ("wParamH", wintypes.WORD),
+        ]
+
     class INPUT(ctypes.Structure):
         class _U(ctypes.Union):
-            _fields_ = [("ki", KEYBDINPUT)]
-        _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+            _fields_ = [
+                ("mi", MOUSEINPUT),
+                ("ki", KEYBDINPUT),
+                ("hi", HARDWAREINPUT),
+            ]
+        _fields_ = [
+            ("type", wintypes.DWORD),
+            ("u", _U),
+        ]
 
     _gdi32 = ctypes.windll.gdi32
     _dwmapi = ctypes.windll.dwmapi
@@ -214,9 +238,12 @@ if OS == "Windows":
     _user32.mouse_event.restype = None
 
     try:
-        _user32.SetProcessDPIAware()
+        _user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except Exception:
-        pass
+        try:
+            _user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
     _gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
     _gdi32.CreateCompatibleDC.restype = wintypes.HDC
@@ -594,13 +621,20 @@ def _win_focus_window(target_hwnd):
     if target_tid and target_tid != cur_tid:
         _user32.AttachThreadInput(cur_tid, target_tid, True)
 
-    _user32.LockSetForegroundWindow(2)  # LSFW_UNLOCK
-    _user32.keybd_event(0x12, 0, 0, 0)  # VK_MENU down
-    _user32.keybd_event(0x12, 0, 2, 0)  # VK_MENU up
-    _user32.SetWindowPos(target_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
-    _user32.SetWindowPos(target_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
-    _user32.BringWindowToTop(target_hwnd)
-    _user32.SetForegroundWindow(target_hwnd)
+    if fore_wnd != target_hwnd and _user32.GetAncestor(fore_wnd, 2) != target_hwnd:
+        _user32.LockSetForegroundWindow(2)  # LSFW_UNLOCK
+        _user32.keybd_event(0x12, 0, 0, 0)  # VK_MENU down
+        _user32.keybd_event(0x12, 0, 2, 0)  # VK_MENU up
+        _user32.SetWindowPos(target_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        _user32.SetWindowPos(target_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        _user32.BringWindowToTop(target_hwnd)
+        _user32.SetForegroundWindow(target_hwnd)
+        time.sleep(0.02)
+        _user32.keybd_event(0x1B, 0, 0, 0)  # VK_ESCAPE down
+        _user32.keybd_event(0x1B, 0, 2, 0)  # VK_ESCAPE up
+    else:
+        _user32.BringWindowToTop(target_hwnd)
+        _user32.SetForegroundWindow(target_hwnd)
 
     if fore_tid and fore_tid != cur_tid:
         _user32.AttachThreadInput(cur_tid, fore_tid, False)
@@ -727,8 +761,10 @@ def win_see(app, output_path=None):
 
 
 def _win_type_raw(target, text):
-    _win_focus_window(target["hwnd"])
-    time.sleep(0.05)
+    fore = _user32.GetForegroundWindow()
+    if fore != target["hwnd"] and _user32.GetAncestor(fore, 2) != target["hwnd"]:
+        _win_focus_window(target["hwnd"])
+        time.sleep(0.05)
 
     KEYEVENTF_KEYUP = 0x0002
     KEYEVENTF_UNICODE = 0x0004
@@ -750,9 +786,11 @@ def _win_type_raw(target, text):
             code = ord(char)
             inputs = (INPUT * 2)()
             inputs[0].type = INPUT_KEYBOARD
+            inputs[0].u.ki.wVk = 0
             inputs[0].u.ki.wScan = code
             inputs[0].u.ki.dwFlags = KEYEVENTF_UNICODE
             inputs[1].type = INPUT_KEYBOARD
+            inputs[1].u.ki.wVk = 0
             inputs[1].u.ki.wScan = code
             inputs[1].u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
             _user32.SendInput(2, inputs, ctypes.sizeof(INPUT))
@@ -782,13 +820,16 @@ def win_type(app, text):
 
 
 def _win_key_raw(target, key_name):
-    _win_focus_window(target["hwnd"])
-    time.sleep(0.05)
+    fore = _user32.GetForegroundWindow()
+    if fore != target["hwnd"] and _user32.GetAncestor(fore, 2) != target["hwnd"]:
+        _win_focus_window(target["hwnd"])
+        time.sleep(0.05)
 
     VK_MAP = {
         "enter": 0x0D, "return": 0x0D, "tab": 0x09, "escape": 0x1B, "esc": 0x1B,
         "backspace": 0x08, "space": 0x20, "up": 0x26, "down": 0x28, "left": 0x25,
         "right": 0x27, "delete": 0x2E, "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+        "alt": 0x12, "menu": 0x12, "ctrl": 0x11, "control": 0x11, "shift": 0x10,
         **{f"f{i}": 0x6F + i for i in range(1, 13)}
     }
 
@@ -816,20 +857,32 @@ def _win_key_raw(target, key_name):
 
     def key_event(v, up=False):
         flags = 0x0002 if up else 0
-        scan = _user32.MapVirtualKeyW(v, 0)
+        scan = 0 if v in (0x10, 0x11, 0x12) else _user32.MapVirtualKeyW(v, 0)
         _user32.keybd_event(v, scan, flags, 0)
 
-    if ctrl: key_event(0x11, False)
-    if shift: key_event(0x10, False)
-    if alt: key_event(0x12, False)
+    if ctrl:
+        key_event(0x11, False)
+        time.sleep(0.03)
+    if shift:
+        key_event(0x10, False)
+        time.sleep(0.03)
+    if alt:
+        key_event(0x12, False)
+        time.sleep(0.03)
 
     key_event(vk, False)
-    time.sleep(0.02)
+    time.sleep(0.05)
     key_event(vk, True)
 
-    if alt: key_event(0x12, True)
-    if shift: key_event(0x10, True)
-    if ctrl: key_event(0x11, True)
+    if alt:
+        time.sleep(0.03)
+        key_event(0x12, True)
+    if shift:
+        time.sleep(0.03)
+        key_event(0x10, True)
+    if ctrl:
+        time.sleep(0.03)
+        key_event(0x11, True)
 
 
 def win_key(app, key_name):
@@ -857,8 +910,10 @@ def win_key(app, key_name):
 
 
 def _win_click_raw(target, x, y, button="left"):
-    _win_focus_window(target["hwnd"])
-    time.sleep(0.05)
+    fore = _user32.GetForegroundWindow()
+    if fore != target["hwnd"] and _user32.GetAncestor(fore, 2) != target["hwnd"]:
+        _win_focus_window(target["hwnd"])
+        time.sleep(0.05)
 
     rect = RECT()
     if _dwmapi.DwmGetWindowAttribute(target["hwnd"], 9, ctypes.byref(rect), ctypes.sizeof(RECT)) != 0:
