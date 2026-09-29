@@ -55,6 +55,26 @@ Desktop DOM / semantic tree control:
 - **`query`**: Searches semantic elements matching criteria without hardcoded coordinates.
 - **`a11y-click`**: Semantically locates the element, calculates its exact center relative to the window, focuses, and clicks without coordinate guesswork.
 
+### Tier C: Local Vision & OCR Grounding (Phase 7)
+```bash
+appctl ocr <app_or_image>
+appctl vision-find <app_or_image> <text_query>
+appctl vision-click <app> <text_query> [--button <left|right|double>]
+```
+Offline local visual grounding (native Windows.Media.Ocr):
+- **`ocr`**: Extracts recognized text, lines, and word bounding boxes `[x, y, w, h]` with zero pip dependencies.
+- **`vision-find`**: Grounds query text visually to relative coordinates and confidence score.
+- **`vision-click`**: Captures snapshot, visually grounds target text, and clicks it when semantic a11y tree is unavailable.
+
+### Sub-1GB Local Decision Router & Benchmark (Build Order 5)
+```bash
+appctl route "<task_description>" [--context-json ...]
+appctl benchmark [--json]
+```
+Local System 1 routing engine (<35MB RAM, <1ms latency):
+- **`route`**: Maps natural language task intent to optimal control tier (S -> A -> B -> C -> D), registered tool, and validated arguments.
+- **`benchmark`**: Evaluates standardized 20-task suite, generating coverage scorecard metrics.
+
 ## Verifier Contract
 
 Every command exits with `0` (ok) or `1` (failure) and prints typed JSON on stdout conforming to The Architect verifier contract:

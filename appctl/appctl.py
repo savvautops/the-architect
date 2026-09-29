@@ -54,6 +54,22 @@ except ImportError:
     except ImportError:
         run_a11y_tree = run_a11y_query = run_a11y_click = None
 
+try:
+    from appctl.vision import ocr_image, run_vision_find, run_vision_click
+except ImportError:
+    try:
+        from vision import ocr_image, run_vision_find, run_vision_click
+    except ImportError:
+        ocr_image = run_vision_find = run_vision_click = None
+
+try:
+    from appctl.router import LocalRouter, run_benchmark
+except ImportError:
+    try:
+        from router import LocalRouter, run_benchmark
+    except ImportError:
+        LocalRouter = run_benchmark = None
+
 OS = platform.system()  # Windows | Darwin | Linux
 
 
@@ -1616,8 +1632,61 @@ def run_exec(tool_id, args_json_str=None):
             })
         else:
             return fail("exec", f"macro execution not supported on OS: {OS}")
+    elif action == "ocr":
+        if not ocr_image:
+            return fail("exec", "vision module not available")
+        target = validated_args["target"]
+        temp_file = None
+        if not os.path.isfile(target):
+            temp_file = os.path.abspath(f"temp_ocr_{int(time.time()*1000)}.png")
+            h["see"](target, temp_file)
+            target = temp_file
+        try:
+            res = ocr_image(target)
+            return emit(res, code=0 if res.get("ok") else 1)
+        finally:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    pass
+    elif action == "vision_find":
+        if not run_vision_find:
+            return fail("exec", "vision module not available")
+        res = run_vision_find(
+            validated_args["app"],
+            validated_args["query"],
+            resolve_fn=h.get("resolve"),
+            see_fn=lambda a, o: h["see"](a, o),
+        )
+        return emit(res, code=0 if res.get("ok") else 1)
+    elif action == "vision_click":
+        if not run_vision_click:
+            return fail("exec", "vision module not available")
+        res = run_vision_click(
+            validated_args["app"],
+            validated_args["query"],
+            button=validated_args.get("button", "left"),
+            resolve_fn=h.get("resolve"),
+            see_fn=lambda a, o: h["see"](a, o),
+            click_fn=h.get("click_raw"),
+            focus_fn=h.get("focus_raw"),
+        )
+        return emit(res, code=0 if res.get("ok") else 1)
+    elif action == "route":
+        if not LocalRouter:
+            return fail("exec", "router module not available")
+        r = LocalRouter()
+        dec = r.route(validated_args["task"], validated_args.get("context", {}))
+        return emit(dec.to_dict(), code=0 if dec.ok else 1)
+    elif action == "benchmark":
+        if not run_benchmark:
+            return fail("exec", "router module not available")
+        rep = run_benchmark()
+        return emit(rep, code=0 if rep.get("ok") else 1)
     else:
         return fail("exec", f"unknown action '{action}' for tool '{tool_id}'")
+
 
 
 def main():
@@ -1700,6 +1769,25 @@ def main():
     p.add_argument("--id", default=None, help="automation ID regex/substring filter")
     p.add_argument("--button", choices=["left", "right", "double"], default="left", help="mouse button action (default: left)")
 
+    p = sub.add_parser("ocr", help="run local OCR on application window or image file")
+    p.add_argument("target", help="application name or image file path")
+
+    p = sub.add_parser("vision-find", help="locate text query visually in app window or image")
+    p.add_argument("target", help="application name or image file path")
+    p.add_argument("query", help="text query to locate")
+
+    p = sub.add_parser("vision-click", help="locate text query visually and click it")
+    p.add_argument("app")
+    p.add_argument("query")
+    p.add_argument("--button", choices=["left", "right", "double"], default="left", help="mouse button action (default: left)")
+
+    p = sub.add_parser("route", help="route a task through the local decision router")
+    p.add_argument("task", help="task description to route")
+    p.add_argument("--context-json", default=None, help="JSON context string")
+
+    p = sub.add_parser("benchmark", help="run the sub-1GB local router benchmark")
+    p.add_argument("--json", action="store_true", help="output JSON")
+
     a = ap.parse_args()
 
     h = HANDLERS.get(OS)
@@ -1752,6 +1840,70 @@ def main():
         )
         emit(res, code=0 if res.get("ok") else 1)
         return
+    elif a.action == "ocr":
+        if not ocr_image:
+            fail("ocr", "vision module not available")
+        target_path = a.target
+        temp_file = None
+        if not os.path.isfile(target_path):
+            temp_file = os.path.abspath(f"temp_ocr_{int(time.time()*1000)}.png")
+            h["see"](target_path, temp_file)
+            target_path = temp_file
+        try:
+            res = ocr_image(target_path)
+            emit(res, code=0 if res.get("ok") else 1)
+        finally:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    pass
+        return
+    elif a.action == "vision-find":
+        if not run_vision_find:
+            fail("vision-find", "vision module not available")
+        res = run_vision_find(
+            a.target,
+            a.query,
+            resolve_fn=h.get("resolve"),
+            see_fn=lambda app, out: h["see"](app, out),
+        )
+        emit(res, code=0 if res.get("ok") else 1)
+        return
+    elif a.action == "vision-click":
+        if not run_vision_click:
+            fail("vision-click", "vision module not available")
+        res = run_vision_click(
+            a.app,
+            a.query,
+            button=a.button,
+            resolve_fn=h.get("resolve"),
+            see_fn=lambda app, out: h["see"](app, out),
+            click_fn=h.get("click_raw"),
+            focus_fn=h.get("focus_raw"),
+        )
+        emit(res, code=0 if res.get("ok") else 1)
+        return
+    elif a.action == "route":
+        if not LocalRouter:
+            fail("route", "router module not available")
+        r = LocalRouter()
+        ctx = json.loads(a.context_json) if a.context_json else {}
+        dec = r.route(a.task, ctx)
+        is_valid, err = r.validate_decision(dec)
+        out = dec.to_dict()
+        out["schema_valid"] = is_valid
+        if err:
+            out["schema_error"] = err
+        emit(out, code=0 if dec.ok and is_valid else 1)
+        return
+    elif a.action == "benchmark":
+        if not run_benchmark:
+            fail("benchmark", "router module not available")
+        rep = run_benchmark()
+        emit(rep, code=0 if rep.get("ok") else 1)
+        return
+
 
     if a.action == "list":
         h["list"]()

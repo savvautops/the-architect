@@ -338,6 +338,81 @@ SEED_REGISTRY: List[Dict[str, Any]] = [
         "risk": "medium"
     },
 
+    # ----------------------------------------------------------- vision tools -
+    {
+        "tool_id": "vision.ocr",
+        "app": "system",
+        "action": "ocr",
+        "inputs": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Target application name or image file path"}
+            },
+            "required": ["target"]
+        },
+        "expect": {"postconditions": ["text_recognized_with_bounds"]},
+        "risk": "low"
+    },
+    {
+        "tool_id": "vision.find",
+        "app": "system",
+        "action": "vision_find",
+        "inputs": {
+            "type": "object",
+            "properties": {
+                "app": {"type": "string", "description": "Target application name or image file path"},
+                "query": {"type": "string", "description": "Text query to locate visually"}
+            },
+            "required": ["app", "query"]
+        },
+        "expect": {"postconditions": ["visual_text_grounded"]},
+        "risk": "low"
+    },
+    {
+        "tool_id": "vision.click",
+        "app": "system",
+        "action": "vision_click",
+        "inputs": {
+            "type": "object",
+            "properties": {
+                "app": {"type": "string", "description": "Target application name"},
+                "query": {"type": "string", "description": "Text query to locate and click visually"},
+                "button": {"type": "string", "enum": ["left", "right", "double"], "description": "Mouse button action (default: left)"}
+            },
+            "required": ["app", "query"]
+        },
+        "expect": {"postconditions": ["visual_target_clicked"]},
+        "risk": "medium"
+    },
+
+    # ----------------------------------------------------------- router tools -
+    {
+        "tool_id": "router.route",
+        "app": "system",
+        "action": "route",
+        "inputs": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "Task or intent description to route"},
+                "context": {"type": "object", "description": "Contextual state (app, has_a11y, etc.)"}
+            },
+            "required": ["task"]
+        },
+        "expect": {"postconditions": ["decision_calibrated", "tool_selected"]},
+        "risk": "low"
+    },
+    {
+        "tool_id": "router.benchmark",
+        "app": "system",
+        "action": "benchmark",
+        "inputs": {
+            "type": "object",
+            "properties": {}
+        },
+        "expect": {"postconditions": ["scorecard_generated"]},
+        "risk": "low"
+    },
+
     # ----------------------------------------------------------- editor tools -
     {
         "tool_id": "editor.save_all",
